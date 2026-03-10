@@ -14,19 +14,28 @@ from dotenv import load_dotenv
 
 
 # ----------------------------
-# FORCE-LOAD .env FROM THIS SCRIPT'S FOLDER (VS CODE SAFE)
+# OPTIONAL .env LOAD (local-dev friendly, GitHub Actions safe)
 # ----------------------------
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-loaded = load_dotenv(dotenv_path=ENV_PATH, override=True)
+loaded = load_dotenv(dotenv_path=ENV_PATH, override=False) if ENV_PATH.exists() else False
 print("Loaded .env:", loaded, "from", str(ENV_PATH))
+
+
+def getenv_first(*names: str, default: Optional[str] = None) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip() != "":
+            return value
+    return default
+
 
 # ----------------------------
 # ENV CONFIG
 # ----------------------------
-SHOP = os.getenv("SHOPIFY_SHOP")
-TOKEN = os.getenv("SHOPIFY_ADMIN_ACCESS_TOKEN")
-API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-07")
-LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID")
+SHOP = getenv_first("SHOPIFY_STORE", "SHOPIFY_SHOP")
+TOKEN = getenv_first("SHOPIFY_TOKEN", "SHOPIFY_ADMIN_ACCESS_TOKEN")
+API_VERSION = getenv_first("API_VERSION", "SHOPIFY_API_VERSION", default="2025-07")
+LOCATION_ID = getenv_first("LOCATION_ID", "SHOPIFY_LOCATION_ID")
 
 DRAFT_ORDER_NAMES = [
     x.strip() for x in (os.getenv("DRAFT_ORDER_NAMES") or "").split(",") if x.strip()
@@ -70,11 +79,23 @@ def build_draft_name_query(names: list[str]) -> str:
             parts.append(f"name:{v}")
     return " OR ".join(parts)
 
+def build_recent_open_drafts_query(lookback_days: Optional[int] = None) -> str:
+    """Build a bounded Shopify search query for recent open draft orders."""
+    days = LOOKBACK_DAYS if lookback_days is None else int(lookback_days)
+    days = max(days, 0)
+    if days <= 0:
+        return "status:open"
+    return f"status:open updated_at:>=-{days}d"
+
+
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 MAX_DRAFTS = int(os.getenv("MAX_DRAFTS", "250"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 
 PO_SUFFIX_FORMAT = os.getenv("PO_SUFFIX_FORMAT", " - BO{bucket}")
 IDEMPOTENCY_DONE_TAG = os.getenv("IDEMPOTENCY_DONE_TAG", "split-backorder-done")
+CHILD_TAG = os.getenv("CHILD_TAG", "split-backorder-child").strip() or "split-backorder-child"
+PROCESSING_TAG = os.getenv("PROCESSING_TAG", "split-backorder-processing").strip() or "split-backorder-processing"
 
 # Linking fields (optional but recommended)
 LINK_CUSTOM_ATTR_PO_KEY = (os.getenv("LINK_CUSTOM_ATTR_PO_KEY") or "original_poNumber").strip()
@@ -107,11 +128,14 @@ print("API_VERSION  =", API_VERSION)
 print("DRAFT_ORDER_NAMES =", DRAFT_ORDER_NAMES)
 print("LOCATION_ID =", LOCATION_ID)
 print("DRY_RUN =", DRY_RUN)
+print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
+print("CHILD_TAG =", CHILD_TAG)
+print("PROCESSING_TAG =", PROCESSING_TAG)
 
 if not SHOP or not TOKEN:
-    raise SystemExit("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_ACCESS_TOKEN in .env")
+    raise SystemExit("Missing Shopify store/token. Set SHOPIFY_STORE or SHOPIFY_SHOP, and SHOPIFY_TOKEN or SHOPIFY_ADMIN_ACCESS_TOKEN.")
 if not LOCATION_ID:
-    raise SystemExit("Missing SHOPIFY_LOCATION_ID in .env")
+    raise SystemExit("Missing location id. Set LOCATION_ID or SHOPIFY_LOCATION_ID.")
 
 GRAPHQL_URL = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
 
@@ -626,7 +650,7 @@ def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[st
 
     and whose ORIGINAL_DRAFT_ID metafield equals the original_draft_id.
     """
-    q = f'tag:"Backorder #{bucket}" tag:split-backorder-child status:open'
+    q = f'tag:"Backorder #{bucket}" tag:"{CHILD_TAG}" status:open'
     after = None
     while True:
         resp = gql(
@@ -846,12 +870,16 @@ def process_draft(draft_id: str) -> str:
     existing_tags = set(draft.get("tags") or [])
 
     # Never process child drafts as originals
-    if "split-backorder-child" in existing_tags:
-        print(f"{draft.get('name')}: SKIP (is a split child; tag 'split-backorder-child' present).")
-        return
+    if CHILD_TAG in existing_tags:
+        print(f"{draft.get('name')}: SKIP (is a split child; tag '{CHILD_TAG}' present).")
+        return "skipped"
 
     if IDEMPOTENCY_DONE_TAG in existing_tags:
         print(f"{draft['name']}: SKIP (already processed; tag '{IDEMPOTENCY_DONE_TAG}' present).")
+        return "skipped"
+
+    if PROCESSING_TAG in existing_tags:
+        print(f"{draft.get('name')}: SKIP (already in progress; tag '{PROCESSING_TAG}' present).")
         return "skipped"
 
     lines = (draft.get("lineItems") or {}).get("nodes") or []
@@ -910,6 +938,20 @@ def process_draft(draft_id: str) -> str:
     print(f"\nProcessing {original_name} (DRY_RUN={DRY_RUN})")
     newly_created_child_ids: List[Tuple[int,str]] = []  # (bucket, draft_id)
     print(f"  Original PO: {original_po!r}")
+
+    # Mark the parent draft as in-progress before touching child drafts.
+    if not DRY_RUN:
+        processing_tags = list(original_tags)
+        if PROCESSING_TAG not in processing_tags:
+            processing_tags.append(PROCESSING_TAG)
+        processing_input: Dict[str, Any] = {"tags": processing_tags}
+        print(f"  Marking original as in-progress with tag '{PROCESSING_TAG}'")
+        errs_processing, processing_node = draft_update_return(draft_id, processing_input, label="mark processing")
+        if errs_processing:
+            raise RuntimeError(f"failed to mark original as processing: {errs_processing}")
+        processing_node_tags = set(processing_node.get("tags") or [])
+        if PROCESSING_TAG not in processing_node_tags:
+            raise RuntimeError(f"failed to verify processing tag '{PROCESSING_TAG}' on original")
     if primary_bucket_for_original is None:
         print(f"  Original keeps ship-now lines: {len(keep)}")
     else:
@@ -954,7 +996,7 @@ def process_draft(draft_id: str) -> str:
         bucket_tag = f"Backorder #{bucket}"
         if bucket_tag not in new_tags:
             new_tags.append(bucket_tag)
-        child_tag = "split-backorder-child"
+        child_tag = CHILD_TAG
         if child_tag not in new_tags:
             new_tags.append(child_tag)
 
@@ -992,7 +1034,7 @@ def process_draft(draft_id: str) -> str:
             raise
 
     # 2) Update original draft with keep lines + idempotency
-    updated_tags = list(original_tags)
+    updated_tags = [t for t in original_tags if t != PROCESSING_TAG]
     if IDEMPOTENCY_DONE_TAG not in updated_tags:
         updated_tags.append(IDEMPOTENCY_DONE_TAG)
     if primary_bucket_for_original is not None:
@@ -1021,12 +1063,27 @@ def process_draft(draft_id: str) -> str:
         # Verify original update using mutation response (fast, no extra query)
         v_tags = set(updated_node.get("tags") or [])
         v_total = get_lineitems_total_count(updated_node)
-        if IDEMPOTENCY_DONE_TAG not in v_tags or (v_total is not None and v_total != len(keep)):
+        if IDEMPOTENCY_DONE_TAG not in v_tags or PROCESSING_TAG in v_tags or (v_total is not None and v_total != len(keep)):
             raise RuntimeError(
                 f"post-update verification failed: tag_present={IDEMPOTENCY_DONE_TAG in v_tags} "
+                f"processing_tag_present={PROCESSING_TAG in v_tags} "
                 f"line_count={v_total} expected={len(keep)}"
             )
         print(f"    Verified original updated: {updated_node.get('name')} | lines={v_total}")
+
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        customer = customer_label_for_log(draft)
+        row: Dict[str, str] = {
+            "timestamp": ts,
+            "po_number": base_po,
+            "customer": customer,
+            "original_name": original_name or "",
+            "original_draft_id": draft_id,
+        }
+        for b in range(1, LOG_MAX_BUCKET + 1):
+            row[f"BO{b}_draft_id"] = bo_draft_ids.get(b, "")
+
+        upsert_split_log_row(csv_path=Path(__file__).resolve().parent / LOG_CSV_PATH, row=row)
         return "success"
     except Exception as e:
         print(f"    ERROR updating/verifying original: {e}")
@@ -1035,8 +1092,7 @@ def process_draft(draft_id: str) -> str:
             draft_delete(did, label=f"rollback child bucket #{b}")
 
         # Restore original lineItems and tags to pre-run state (best-effort)
-        restore_tags = list(original_tags)
-        restore_tags = [t for t in restore_tags if t != IDEMPOTENCY_DONE_TAG]
+        restore_tags = [t for t in original_tags if t not in {IDEMPOTENCY_DONE_TAG, PROCESSING_TAG}]
         restore_input: Dict[str, Any] = {
             "lineItems": original_full_line_items_input,
             "tags": restore_tags,
@@ -1047,23 +1103,6 @@ def process_draft(draft_id: str) -> str:
             print(f"    WARNING: restore original userErrors: {errs_restore}")
         raise
 
-    # ----------------------------
-    # Write / update CSV log
-    # ----------------------------
-    ts = datetime.datetime.now().isoformat(timespec="seconds")
-    customer = customer_label_for_log(draft)
-    row: Dict[str, str] = {
-        "timestamp": ts,
-        "po_number": base_po,
-        "customer": customer,
-        "original_name": original_name or "",
-        "original_draft_id": draft_id,
-    }
-    for b in range(1, LOG_MAX_BUCKET + 1):
-        row[f"BO{b}_draft_id"] = bo_draft_ids.get(b, "")
-
-    upsert_split_log_row(csv_path=Path(__file__).resolve().parent / LOG_CSV_PATH, row=row)
-    return "success"
 
 
 
@@ -1090,7 +1129,8 @@ def main() -> None:
         CHUNK_SIZE = 12  # keep query strings comfortably under Shopify limits
         for chunk in chunk_list(DRAFT_ORDER_NAMES, CHUNK_SIZE):
             name_query = build_draft_name_query(chunk)
-            query = f"status:open ({name_query})" if name_query else "status:open"
+            base_query = build_recent_open_drafts_query()
+            query = f"{base_query} ({name_query})" if name_query else base_query
 
             after = None
             while True:
@@ -1112,7 +1152,7 @@ def main() -> None:
                     break
     else:
         # Default: scan a bounded number of open drafts
-        query = "status:open"
+        query = build_recent_open_drafts_query()
         page_size = min(250, MAX_DRAFTS)
         after = None
         while True:
