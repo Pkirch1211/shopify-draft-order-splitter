@@ -28,6 +28,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug env presence
+        shell: bash
+        env:
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.LOCATION_ID }}
+          API_VERSION: ${{ vars.API_VERSION }}
+        run: |
+          echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
+          echo "API_VERSION -> ${API_VERSION:-MISSING}"
+
       - name: Run draft splitter
         env:
           SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
