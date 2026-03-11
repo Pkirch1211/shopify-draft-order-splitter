@@ -31,9 +31,9 @@ jobs:
       - name: Debug env presence
         shell: bash
         env:
-          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
-          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_STORE }}
-          SHOPIFY_LOCATION_ID: ${{ secrets.LOCATION_ID }}
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
           API_VERSION: ${{ vars.API_VERSION }}
         run: |
           echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
@@ -43,9 +43,9 @@ jobs:
 
       - name: Run draft splitter
         env:
-          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
-          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_STORE }}
-          SHOPIFY_LOCATION_ID: ${{ secrets.LOCATION_ID }}
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
 
           API_VERSION: ${{ vars.API_VERSION }}
           DRY_RUN: ${{ vars.DRY_RUN }}
