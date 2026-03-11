@@ -1,10 +1,9 @@
-
-
 import os
 import re
 import time
 import csv
 import datetime
+import logging
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,32 +13,83 @@ from dotenv import load_dotenv
 
 
 # ----------------------------
-# OPTIONAL .env LOAD (local-dev friendly, GitHub Actions safe)
+# FORCE-LOAD .env FROM THIS SCRIPT'S FOLDER (VS CODE SAFE)
 # ----------------------------
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-loaded = load_dotenv(dotenv_path=ENV_PATH, override=False) if ENV_PATH.exists() else False
+loaded = load_dotenv(dotenv_path=ENV_PATH, override=True)
 print("Loaded .env:", loaded, "from", str(ENV_PATH))
-
-
-def getenv_first(*names: str, default: Optional[str] = None) -> Optional[str]:
-    for name in names:
-        value = os.getenv(name)
-        if value is not None and str(value).strip() != "":
-            return value
-    return default
-
 
 # ----------------------------
 # ENV CONFIG
 # ----------------------------
-SHOP = getenv_first("SHOPIFY_STORE", "SHOPIFY_SHOP")
-TOKEN = getenv_first("SHOPIFY_TOKEN", "SHOPIFY_ADMIN_ACCESS_TOKEN")
-API_VERSION = getenv_first("API_VERSION", "SHOPIFY_API_VERSION", default="2025-07")
-LOCATION_ID = getenv_first("LOCATION_ID", "SHOPIFY_LOCATION_ID")
+SHOP = os.getenv("SHOPIFY_SHOP")
+TOKEN = os.getenv("SHOPIFY_ADMIN_ACCESS_TOKEN")
+API_VERSION = os.getenv("SHOPIFY_API_VERSION", os.getenv("API_VERSION", "2025-07"))
+LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID")
 
 DRAFT_ORDER_NAMES = [
     x.strip() for x in (os.getenv("DRAFT_ORDER_NAMES") or "").split(",") if x.strip()
 ]
+
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+MAX_DRAFTS = int(os.getenv("MAX_DRAFTS", "250"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
+LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
+
+PO_SUFFIX_FORMAT = os.getenv("PO_SUFFIX_FORMAT", " - BO{bucket}")
+IDEMPOTENCY_DONE_TAG = os.getenv("IDEMPOTENCY_DONE_TAG", "split-backorder-done")
+PROCESSING_TAG = os.getenv("PROCESSING_TAG", "split-backorder-processing")
+CHILD_TAG = os.getenv("CHILD_TAG", "split-backorder-child")
+
+# Linking fields (optional but recommended)
+LINK_CUSTOM_ATTR_PO_KEY = (os.getenv("LINK_CUSTOM_ATTR_PO_KEY") or "original_poNumber").strip()
+LINK_CUSTOM_ATTR_DRAFTID_KEY = (os.getenv("LINK_CUSTOM_ATTR_DRAFTID_KEY") or "original_draft_id").strip()
+
+LINK_METAFIELD_NAMESPACE = (os.getenv("LINK_METAFIELD_NAMESPACE") or "lifelines").strip()
+LINK_METAFIELD_KEY = (os.getenv("LINK_METAFIELD_KEY") or "original_po_number").strip()
+LINK_METAFIELD_TYPE = (os.getenv("LINK_METAFIELD_TYPE") or "single_line_text_field").strip()
+
+# Preferred metafields for your B2B workflow
+PO_METAFIELD_NAMESPACE = (os.getenv("PO_METAFIELD_NAMESPACE") or "b2b").strip()
+PO_METAFIELD_KEY = (os.getenv("PO_METAFIELD_KEY") or "po_number").strip()
+PO_METAFIELD_TYPE = (os.getenv("PO_METAFIELD_TYPE") or "single_line_text_field").strip()
+
+ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE = (
+    os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE") or "custom"
+).strip()
+ORIGINAL_DRAFT_ID_METAFIELD_KEY = (
+    os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_KEY") or "original_draft_id"
+).strip()
+ORIGINAL_DRAFT_ID_METAFIELD_TYPE = (
+    os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_TYPE") or "single_line_text_field"
+).strip()
+
+# Payment terms
+PAYMENT_TERMS_TEMPLATE_ID_FALLBACK = (os.getenv("PAYMENT_TERMS_TEMPLATE_ID") or "").strip()
+SET_PAYMENT_TERMS_ON_CHILDREN = (
+    os.getenv("SET_PAYMENT_TERMS_ON_CHILDREN") or "true"
+).lower() == "true"
+
+print("SHOPIFY_SHOP =", SHOP)
+print("API_VERSION  =", API_VERSION)
+print("DRAFT_ORDER_NAMES =", DRAFT_ORDER_NAMES)
+print("LOCATION_ID =", LOCATION_ID)
+print("DRY_RUN =", DRY_RUN)
+print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
+print("PROCESSING_TAG =", PROCESSING_TAG)
+
+if not SHOP or not TOKEN:
+    raise SystemExit("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_ACCESS_TOKEN in .env")
+if not LOCATION_ID:
+    raise SystemExit("Missing SHOPIFY_LOCATION_ID in .env")
+
+GRAPHQL_URL = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("shopify-draft-order-splitter")
 
 
 def normalize_draft_name(name: str) -> str:
@@ -52,9 +102,10 @@ def normalize_draft_name(name: str) -> str:
         s = s[1:]
     return s.strip().upper()
 
-def build_draft_name_query(names: list[str]) -> str:
+
+def build_draft_name_query(names: List[str]) -> str:
     """Build a robust Shopify draftOrders search query for a list of draft names."""
-    vals: list[str] = []
+    vals: List[str] = []
     seen = set()
     for n in names:
         raw = str(n).strip()
@@ -79,66 +130,6 @@ def build_draft_name_query(names: list[str]) -> str:
             parts.append(f"name:{v}")
     return " OR ".join(parts)
 
-def build_recent_open_drafts_query(lookback_days: Optional[int] = None) -> str:
-    """Build a bounded Shopify search query for recent open draft orders."""
-    days = LOOKBACK_DAYS if lookback_days is None else int(lookback_days)
-    days = max(days, 0)
-    if days <= 0:
-        return "status:open"
-    return f"status:open updated_at:>=-{days}d"
-
-
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-MAX_DRAFTS = int(os.getenv("MAX_DRAFTS", "250"))
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
-
-PO_SUFFIX_FORMAT = os.getenv("PO_SUFFIX_FORMAT", " - BO{bucket}")
-IDEMPOTENCY_DONE_TAG = os.getenv("IDEMPOTENCY_DONE_TAG", "split-backorder-done")
-CHILD_TAG = os.getenv("CHILD_TAG", "split-backorder-child").strip() or "split-backorder-child"
-PROCESSING_TAG = os.getenv("PROCESSING_TAG", "split-backorder-processing").strip() or "split-backorder-processing"
-
-# Linking fields (optional but recommended)
-LINK_CUSTOM_ATTR_PO_KEY = (os.getenv("LINK_CUSTOM_ATTR_PO_KEY") or "original_poNumber").strip()
-LINK_CUSTOM_ATTR_DRAFTID_KEY = (os.getenv("LINK_CUSTOM_ATTR_DRAFTID_KEY") or "original_draft_id").strip()
-
-LINK_METAFIELD_NAMESPACE = (os.getenv("LINK_METAFIELD_NAMESPACE") or "lifelines").strip()
-LINK_METAFIELD_KEY = (os.getenv("LINK_METAFIELD_KEY") or "original_po_number").strip()
-LINK_METAFIELD_TYPE = (os.getenv("LINK_METAFIELD_TYPE") or "single_line_text_field").strip()
-
-# Preferred metafields for your B2B workflow (override via .env)
-# Draft order PO metafield (this is the pinned "PO number" box in Admin if you defined it under Draft orders)
-PO_METAFIELD_NAMESPACE = (os.getenv("PO_METAFIELD_NAMESPACE") or "b2b").strip()
-PO_METAFIELD_KEY = (os.getenv("PO_METAFIELD_KEY") or "po_number").strip()
-PO_METAFIELD_TYPE = (os.getenv("PO_METAFIELD_TYPE") or "single_line_text_field").strip()
-
-# Draft order metafield that links each split draft back to the original draft (single line text)
-ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE = (os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE") or "custom").strip()
-ORIGINAL_DRAFT_ID_METAFIELD_KEY = (os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_KEY") or "original_draft_id").strip()
-ORIGINAL_DRAFT_ID_METAFIELD_TYPE = (os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_TYPE") or "single_line_text_field").strip()
-
-# Payment terms safeguard / porting
-# If set, the splitter will set payment terms on children using the original's template id (preferred),
-# or fall back to this template id if original has no terms or cannot be read.
-PAYMENT_TERMS_TEMPLATE_ID_FALLBACK = (os.getenv("PAYMENT_TERMS_TEMPLATE_ID") or "").strip()
-# Set to true to ALWAYS set terms on children when a template id is available (default true).
-SET_PAYMENT_TERMS_ON_CHILDREN = (os.getenv("SET_PAYMENT_TERMS_ON_CHILDREN") or "true").lower() == "true"
-
-print("SHOPIFY_SHOP =", SHOP)
-print("API_VERSION  =", API_VERSION)
-print("DRAFT_ORDER_NAMES =", DRAFT_ORDER_NAMES)
-print("LOCATION_ID =", LOCATION_ID)
-print("DRY_RUN =", DRY_RUN)
-print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
-print("CHILD_TAG =", CHILD_TAG)
-print("PROCESSING_TAG =", PROCESSING_TAG)
-
-if not SHOP or not TOKEN:
-    raise SystemExit("Missing Shopify store/token. Set SHOPIFY_STORE or SHOPIFY_SHOP, and SHOPIFY_TOKEN or SHOPIFY_ADMIN_ACCESS_TOKEN.")
-if not LOCATION_ID:
-    raise SystemExit("Missing location id. Set LOCATION_ID or SHOPIFY_LOCATION_ID.")
-
-GRAPHQL_URL = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
-
 
 # ----------------------------
 # TAG → BUCKET MAP (from .env)
@@ -146,25 +137,16 @@ GRAPHQL_URL = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
 def build_tag_bucket_map() -> Dict[str, int]:
     """
     Supports ANY number of buckets via PRODUCT_TAG_BUCKET_N environment variables.
-
-    Examples:
-      PRODUCT_TAG_BUCKET_1=launch-march-2026
-      PRODUCT_TAG_BUCKET_2=launch-april-2026
-      PRODUCT_TAG_BUCKET_5=launch-july-2026
-
-    Also supports comma-separated tags per bucket:
-      PRODUCT_TAG_BUCKET_4=launch-june-2026,launch-july-2026
+    Also supports comma-separated tags per bucket.
     """
     mapping: Dict[str, int] = {}
 
-    # Find any PRODUCT_TAG_BUCKET_<number> keys in the environment.
     bucket_keys: List[Tuple[int, str]] = []
     for k in os.environ.keys():
         m = re.fullmatch(r"PRODUCT_TAG_BUCKET_(\d+)", k.strip())
         if m:
             bucket_keys.append((int(m.group(1)), k))
 
-    # Fallback to 1..4 if nothing is set (keeps old behavior).
     if not bucket_keys:
         bucket_keys = [(i, f"PRODUCT_TAG_BUCKET_{i}") for i in (1, 2, 3, 4)]
 
@@ -180,9 +162,9 @@ def build_tag_bucket_map() -> Dict[str, int]:
 
 
 TAG_BUCKET_MAP = build_tag_bucket_map()
-MAX_BUCKET = max([1, *TAG_BUCKET_MAP.values()])  # ensure bucket 1 always exists
+MAX_BUCKET = max([1, *TAG_BUCKET_MAP.values()])
 
-# CSV logging config (defaults)
+# CSV logging config
 LOG_CSV_PATH = (os.getenv("LOG_CSV_PATH") or "split_drafts_log.csv").strip()
 LOG_MAX_BUCKET_ENV = (os.getenv("LOG_MAX_BUCKET") or "").strip()
 LOG_MAX_BUCKET = int(LOG_MAX_BUCKET_ENV) if LOG_MAX_BUCKET_ENV else max(10, MAX_BUCKET)
@@ -190,6 +172,7 @@ LOG_MAX_BUCKET = int(LOG_MAX_BUCKET_ENV) if LOG_MAX_BUCKET_ENV else max(10, MAX_
 print("Loaded TAG_BUCKET_MAP:", TAG_BUCKET_MAP)
 print("Max bucket:", MAX_BUCKET)
 print("Idempotency tag:", IDEMPOTENCY_DONE_TAG)
+
 
 # ----------------------------
 # PO NUMBER HANDLING
@@ -208,7 +191,7 @@ def build_po_number(original_po: Optional[str], bucket: int) -> str:
 
 
 # ----------------------------
-# GRAPHQL HELPER (with light retry on throttling)
+# GRAPHQL HELPER
 # ----------------------------
 def gql(query: str, variables: Optional[Dict[str, Any]] = None, *, attempts: int = 5) -> Dict[str, Any]:
     headers = {
@@ -225,10 +208,9 @@ def gql(query: str, variables: Optional[Dict[str, Any]] = None, *, attempts: int
                 json={"query": query, "variables": variables or {}},
                 timeout=60,
             )
-            if resp.status_code == 429 or resp.status_code == 503:
-                # Basic backoff
+            if resp.status_code in (429, 503):
                 sleep_s = min(2 ** i, 10)
-                print(f"  Throttled (HTTP {resp.status_code}). Sleeping {sleep_s}s and retrying...")
+                logger.warning("Throttled (HTTP %s). Sleeping %ss and retrying...", resp.status_code, sleep_s)
                 time.sleep(sleep_s)
                 continue
 
@@ -244,7 +226,7 @@ def gql(query: str, variables: Optional[Dict[str, Any]] = None, *, attempts: int
         except Exception as e:
             last_err = e
             sleep_s = min(2 ** i, 10)
-            print(f"  GraphQL call failed (attempt {i+1}/{attempts}): {e}")
+            logger.warning("GraphQL call failed (attempt %s/%s): %s", i + 1, attempts, e)
             if i < attempts - 1:
                 time.sleep(sleep_s)
     raise RuntimeError(f"GraphQL call failed after {attempts} attempts: {last_err}")
@@ -256,13 +238,12 @@ def gql(query: str, variables: Optional[Dict[str, Any]] = None, *, attempts: int
 QUERY_DRAFTS = """
 query($first:Int!, $after:String, $query:String) {
   draftOrders(first:$first, after:$after, query:$query, reverse:true) {
-    edges { cursor node { id name } }
+    edges { cursor node { id name tags } }
     pageInfo { hasNextPage endCursor }
   }
 }
 """
 
-# Keep the draft detail query focused on what we need for splitting + price preservation.
 QUERY_DRAFT_DETAIL = """
 query($id:ID!, $locationId:ID!, $poNamespace: String!, $poKey: String!) {
   draftOrder(id:$id) {
@@ -343,7 +324,6 @@ mutation($id:ID!, $input:DraftOrderInput!) {
 }
 """
 
-
 MUTATION_DELETE = """
 mutation($id:ID!) {
   draftOrderDelete(input:{id:$id}) {
@@ -353,11 +333,6 @@ mutation($id:ID!) {
 }
 """
 
-
-
-
-
-# Find existing child drafts for an original + bucket (bucket-level idempotency)
 QUERY_FIND_CHILD = """
 query($first:Int!, $after:String, $query:String, $ns:String!, $key:String!) {
   draftOrders(first:$first, after:$after, query:$query, reverse:true) {
@@ -374,6 +349,8 @@ query($first:Int!, $after:String, $query:String, $ns:String!, $key:String!) {
   }
 }
 """
+
+
 # ----------------------------
 # Helpers: Money / Discount / CustomAttributes / Metafields
 # ----------------------------
@@ -398,16 +375,12 @@ def applied_discount_input(ad: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
         "value": ad.get("value"),
         "valueType": ad.get("valueType"),
     }
-    # Keep backward compatible "amount" if present (many stores still accept it).
     if ad.get("amountV2") and ad["amountV2"].get("amount") is not None:
         out["amount"] = str(ad["amountV2"]["amount"])
     return {k: v for k, v in out.items() if v is not None} or None
 
 
 def merge_custom_attributes(existing: List[Dict[str, Any]], additions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    DraftOrderInput.customAttributes expects list of {key,value}. This merges by key.
-    """
     merged: Dict[str, str] = {}
     for item in existing or []:
         k = item.get("key")
@@ -422,7 +395,6 @@ def merge_custom_attributes(existing: List[Dict[str, Any]], additions: List[Dict
     return [{"key": k, "value": v} for k, v in merged.items()]
 
 
-
 def build_linking_fields(
     *,
     base_po: str,
@@ -434,7 +406,7 @@ def build_linking_fields(
     Returns (customAttributesAdditions, metafieldsAdditions)
 
     We always write ORIGINAL_DRAFT_ID metafield so every draft can be traced.
-    We write the PO metafield ONLY on children (unique per bucket), leaving the original unchanged.
+    We write the PO metafield ONLY on children.
     """
     base_po = (base_po or "").strip()
     ca_add = [
@@ -473,13 +445,12 @@ def get_available_qty(line: Dict[str, Any]) -> Optional[int]:
     Returns available inventory at LOCATION_ID for this line's variant.
 
     Behavior:
-    - If inventory tracking is OFF (tracked == False), return None (do not force BO1).
-    - If tracking is ON/unknown but inventoryLevel is missing for the location, treat as 0 available.
-      (Common when the item has no level at that location.)
+    - If inventory tracking is OFF, return None.
+    - If tracking is ON/unknown but inventoryLevel is missing, treat as 0.
     """
     try:
         variant = line.get("variant") or {}
-        inv_item = (variant.get("inventoryItem") or {})
+        inv_item = variant.get("inventoryItem") or {}
         tracked = inv_item.get("tracked")
         if tracked is False:
             return None
@@ -493,7 +464,6 @@ def get_available_qty(line: Dict[str, Any]) -> Optional[int]:
             if q.get("name") == "available":
                 return int(q.get("quantity") or 0)
 
-        # If "available" wasn't returned for some reason, treat as 0 for tracked items.
         return 0
     except Exception:
         return None
@@ -504,14 +474,9 @@ def get_available_qty(line: Dict[str, Any]) -> Optional[int]:
 # ----------------------------
 def decide_bucket(line: Dict[str, Any]) -> Optional[int]:
     """
-    Bucket rules (as requested):
-
-    1) If the product has any configured launch tag, assign that bucket.
-       - Deterministic: lower bucket numbers win if multiple tags match.
-
-    2) ELSE (no launch tag match):
-         If order qty > available qty at LOCATION_ID => bucket 1 (BO1)
-         (Inventory tracking off => we do NOT force BO1.)
+    Bucket rules:
+    1) Product launch tag bucket wins.
+    2) Else if qty > available at LOCATION_ID => bucket 1.
     """
     variant = line.get("variant")
     qty = int(line.get("quantity") or 0)
@@ -521,12 +486,10 @@ def decide_bucket(line: Dict[str, Any]) -> Optional[int]:
 
     tags = set((variant.get("product") or {}).get("tags") or [])
 
-    # Tag buckets first
     for tag, bucket in sorted(TAG_BUCKET_MAP.items(), key=lambda x: x[1]):
         if tag in tags:
             return bucket
 
-    # Only if NO tag bucket applies, use inventory shortfall fallback.
     available = get_available_qty(line)
     if available is not None and available < qty:
         return 1
@@ -534,25 +497,15 @@ def decide_bucket(line: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-
 # ----------------------------
-# BUILD LINE INPUT (price preservation)
+# BUILD LINE INPUT
 # ----------------------------
 def build_line_input(line: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Key detail:
-    - For variant lines, originalUnitPriceWithCurrency is ignored when variantId is set.
-      To preserve the original draft pricing, we use priceOverride:
-        - prefer existing priceOverride
-        - else use originalUnitPriceWithCurrency as priceOverride
-    - For custom lines (no variant), we can use originalUnitPriceWithCurrency.
-    """
     out: Dict[str, Any] = {"quantity": int(line.get("quantity") or 0)}
 
     if line.get("variant"):
         out["variantId"] = line["variant"]["id"]
 
-        # Preserve pricing
         po = money_input(line.get("priceOverride"))
         if po:
             out["priceOverride"] = po
@@ -573,15 +526,14 @@ def build_line_input(line: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in out.items() if v is not None}
 
 
-
 def get_lineitems_total_count(draft_node: Dict[str, Any]) -> Optional[int]:
-    """Best-effort line count from the draftOrderUpdate payload."""
     try:
-        li = (draft_node.get("lineItems") or {})
+        li = draft_node.get("lineItems") or {}
         edges = li.get("edges") or []
         return len(edges)
     except Exception:
         return None
+
 
 # ----------------------------
 # MUTATION WRAPPERS
@@ -601,56 +553,38 @@ def draft_duplicate(original_id: str) -> Dict[str, Any]:
 
 
 def draft_update_return(draft_id: str, input_data: Dict[str, Any], label: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Run draftOrderUpdate and return (userErrors, draftOrder node)."""
     if DRY_RUN:
-        print(f"    DRY RUN — would update {label}: {draft_id}")
+        logger.info("DRY RUN — would update %s: %s", label, draft_id)
         return [], {}
     res = gql(MUTATION_UPDATE, {"id": draft_id, "input": input_data})["draftOrderUpdate"]
     errs = res.get("userErrors") or []
     d = res.get("draftOrder") or {}
     if not errs:
-        print(f"    Updated {label}: {d.get('name')} | poNumber={d.get('poNumber')}")
+        logger.info("Updated %s: %s | poNumber=%s", label, d.get("name"), d.get("poNumber"))
     return errs, d
 
 
-def draft_update_strict(draft_id: str, input_data: Dict[str, Any], label: str) -> None:
-    """Run draftOrderUpdate and raise on userErrors."""
-    errs, d_last = draft_update_return(draft_id, input_data, label)
-    if errs:
-        raise RuntimeError(f"draftOrderUpdate userErrors ({label}): {errs}")
-
-
 def draft_delete(draft_id: str, label: str) -> None:
-    """Delete a draft order (best-effort rollback)."""
     if DRY_RUN:
-        print(f"    DRY RUN — would delete {label}: {draft_id}")
+        logger.info("DRY RUN — would delete %s: %s", label, draft_id)
         return
 
     try:
         res = gql(MUTATION_DELETE, {"id": draft_id})["draftOrderDelete"]
         errs = res.get("userErrors") or []
         if errs:
-            print(f"    WARNING: draftOrderDelete userErrors ({label}): {errs}")
+            logger.warning("draftOrderDelete userErrors (%s): %s", label, errs)
         else:
-            print(f"    Deleted {label}: {draft_id}")
+            logger.info("Deleted %s: %s", label, draft_id)
     except Exception as e:
-        print(f"    WARNING: failed to delete {label} {draft_id}: {e}")
+        logger.warning("Failed to delete %s %s: %s", label, draft_id, e)
 
 
 # ----------------------------
-# CHILD LOOKUP (bucket-level idempotency)
+# CHILD LOOKUP
 # ----------------------------
 def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[str, str]]:
-    """
-    Returns {'id':..., 'name':...} for an existing child draft for this original + bucket, if found.
-
-    We look for drafts tagged:
-      - split-backorder-child
-      - Backorder #{bucket}
-
-    and whose ORIGINAL_DRAFT_ID metafield equals the original_draft_id.
-    """
-    q = f'tag:"Backorder #{bucket}" tag:"{CHILD_TAG}" status:open'
+    q = f'tag:"Backorder #{bucket}" tag:{CHILD_TAG} status:open'
     after = None
     while True:
         resp = gql(
@@ -666,8 +600,8 @@ def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[st
 
         edges = resp.get("edges") or []
         for e in edges:
-            node = (e.get("node") or {})
-            link = (node.get("link") or {})
+            node = e.get("node") or {}
+            link = node.get("link") or {}
             if (link.get("value") or "") == original_draft_id:
                 return {"id": node.get("id", ""), "name": node.get("name", "")}
 
@@ -680,14 +614,10 @@ def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[st
     return None
 
 
-
 # ----------------------------
 # LOG HELPERS
 # ----------------------------
 def customer_label_for_log(draft: Dict[str, Any]) -> str:
-    """
-    Best-effort customer label that does NOT require read_customers scope.
-    """
     for addr_key in ("shippingAddress", "billingAddress"):
         addr = draft.get(addr_key) or {}
         company = (addr.get("company") or "").strip()
@@ -706,10 +636,6 @@ def upsert_split_log_row(
     row: Dict[str, str],
     key_field: str = "original_draft_id",
 ) -> None:
-    """
-    Upsert the row into csv_path using key_field as the unique key.
-    Creates the file with headers if missing.
-    """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing_rows: List[Dict[str, str]] = []
@@ -721,7 +647,6 @@ def upsert_split_log_row(
             headers = list(reader.fieldnames or [])
             existing_rows = list(reader)
 
-    # Ensure headers include all row keys (and keep a stable order)
     def ensure_header(h: str) -> None:
         if h not in headers:
             headers.append(h)
@@ -733,7 +658,6 @@ def upsert_split_log_row(
     replaced = False
     for i, r in enumerate(existing_rows):
         if (r.get(key_field) or "") == key_val and key_val:
-            # Update existing row
             existing_rows[i] = {**r, **row}
             replaced = True
             break
@@ -748,8 +672,7 @@ def upsert_split_log_row(
 
 # ----------------------------
 # PAYMENT TERMS HELPERS
-
-# Net terms inference from draft note (fallback when paymentTerms is blank)
+# ----------------------------
 _VALID_NET_DAYS = {30, 60, 90, 120}
 _NET_PATTERNS = [
     re.compile(r"\bnet\s*[-:]*\s*(30|60|90|120)\b", re.IGNORECASE),
@@ -758,8 +681,8 @@ _NET_PATTERNS = [
     re.compile(r"\bn\s*(30|60|90|120)\b", re.IGNORECASE),
 ]
 
+
 def infer_net_days_from_note(note_text: str) -> int:
-    """Return net days (30/60/90/120) if exactly one clear term is found; else 0."""
     if not note_text:
         return 0
     found = set()
@@ -773,15 +696,14 @@ def infer_net_days_from_note(note_text: str) -> int:
                 found.add(d)
     return next(iter(found)) if len(found) == 1 else 0
 
+
 def template_id_for_net_days(days: int) -> str:
-    """Map days to env var PAYMENT_TERMS_TEMPLATE_ID_NET{days}."""
     if not days:
         return ""
     return (os.getenv(f"PAYMENT_TERMS_TEMPLATE_ID_NET{days}") or "").strip()
 
-# ----------------------------
+
 def payment_terms_template_id_from_draft(draft: Dict[str, Any]) -> str:
-    """Best-effort: map draft.paymentTerms.dueInDays to env PAYMENT_TERMS_TEMPLATE_ID_NET{days}."""
     try:
         pt = draft.get("paymentTerms") or {}
         days = pt.get("dueInDays")
@@ -792,20 +714,16 @@ def payment_terms_template_id_from_draft(draft: Dict[str, Any]) -> str:
     except Exception:
         return ""
 
-def build_payment_terms_input(template_id: str) -> Optional[Dict[str, Any]]:
-    """Return DraftOrderInput.paymentTerms payload (template-only).
 
-    Note: Some Net terms templates require an issue date; we handle that by retrying with issuedAt
-    if Shopify returns "issue date is required".
-    """
+def build_payment_terms_input(template_id: str) -> Optional[Dict[str, Any]]:
     if not template_id:
         return None
     return {
         "paymentTermsTemplateId": template_id,
     }
 
+
 def build_payment_terms_input_with_issue_date(template_id: str) -> Optional[Dict[str, Any]]:
-    """Return DraftOrderInput.paymentTerms payload including an issue date schedule (issuedAt)."""
     if not template_id:
         return None
     issued_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -814,7 +732,7 @@ def build_payment_terms_input_with_issue_date(template_id: str) -> Optional[Dict
         "paymentSchedules": {"issuedAt": issued_at},
     }
 
-# ----------------------------
+
 def apply_update_with_retries(
     *,
     draft_id: str,
@@ -822,69 +740,159 @@ def apply_update_with_retries(
     label: str,
     terms_template_id: str = "",
 ) -> Dict[str, Any]:
-    """Update a draft with a couple of safe retries for known Shopify constraints."""
-    # First attempt
     errs, d_last = draft_update_return(draft_id, input_data, label)
     if not errs:
         return d_last
 
     msg_join = " | ".join((e.get("message", "") or "") for e in errs).lower()
 
-    # Retry 1: Net terms templates sometimes require an issuedAt schedule.
     if "issue date is required" in msg_join and terms_template_id:
         pti2 = build_payment_terms_input_with_issue_date(terms_template_id)
         if pti2:
-            input_data = dict(input_data)  # shallow copy
+            input_data = dict(input_data)
             input_data["paymentTerms"] = pti2
-        errs2, d2 = draft_update_return(draft_id, input_data, label=f"{label} (retry with issuedAt)")
+        errs2, d2 = draft_update_return(
+            draft_id, input_data, label=f"{label} (retry with issuedAt)"
+        )
         if not errs2:
             return d2
         errs = errs2
         msg_join = " | ".join((e.get("message", "") or "") for e in errs).lower()
 
-    # Retry 2: When no remaining items require shipping, Shopify rejects shippingLine.
     if "cannot add shipping when no line items require shipping" in msg_join:
         input_data = dict(input_data)
         input_data["shippingLine"] = None
-        errs3, d3 = draft_update_return(draft_id, input_data, label=f"{label} (retry without shippingLine)")
+        errs3, d3 = draft_update_return(
+            draft_id, input_data, label=f"{label} (retry without shippingLine)"
+        )
         if not errs3:
             return d3
         errs = errs3
 
     raise RuntimeError(f"draftOrderUpdate userErrors ({label}): {errs}")
 
-def process_draft(draft_id: str) -> str:
-    draft = gql(QUERY_DRAFT_DETAIL, {"id": draft_id, "locationId": LOCATION_ID, "poNamespace": PO_METAFIELD_NAMESPACE, "poKey": PO_METAFIELD_KEY})["draftOrder"]
-    if not draft:
-        print(f"Draft not found: {draft_id}")
+
+# ----------------------------
+# TAG / LOCK HELPERS
+# ----------------------------
+def with_tag(tags: List[str], tag: str) -> List[str]:
+    out = list(tags or [])
+    if tag not in out:
+        out.append(tag)
+    return out
+
+
+def without_tag(tags: List[str], tag: str) -> List[str]:
+    return [t for t in (tags or []) if t != tag]
+
+
+def claim_processing_lock(draft: Dict[str, Any]) -> bool:
+    """
+    Best-effort processing tag so repeat runs avoid re-evaluating drafts mid-flight.
+    In DRY_RUN we do not mutate.
+    """
+    tags = list(draft.get("tags") or [])
+
+    if CHILD_TAG in tags:
+        return False
+    if IDEMPOTENCY_DONE_TAG in tags:
+        return False
+    if PROCESSING_TAG in tags:
+        return False
+
+    if DRY_RUN:
+        logger.info("DRY RUN — would add processing tag to %s", draft.get("name"))
+        return True
+
+    new_tags = with_tag(tags, PROCESSING_TAG)
+    errs, updated = draft_update_return(
+        draft["id"],
+        {"tags": new_tags},
+        label="claim processing lock",
+    )
+    if errs:
+        raise RuntimeError(f"Failed to claim processing lock: {errs}")
+
+    updated_tags = set(updated.get("tags") or [])
+    return PROCESSING_TAG in updated_tags
+
+
+def release_processing_lock(draft_id: str, tags: List[str]) -> None:
+    """
+    Remove processing tag only. Best-effort cleanup on failure.
+    """
+    if DRY_RUN:
+        logger.info("DRY RUN — would remove processing tag from %s", draft_id)
         return
 
-    # Optional: process only exact names (normalized)
+    cleaned = without_tag(tags, PROCESSING_TAG)
+    errs, _ = draft_update_return(
+        draft_id,
+        {"tags": cleaned},
+        label="release processing lock",
+    )
+    if errs:
+        logger.warning("Failed to release processing lock for %s: %s", draft_id, errs)
+
+
+# ----------------------------
+# DRAFT PROCESSOR
+# ----------------------------
+def process_draft(draft_id: str) -> str:
+    draft = gql(
+        QUERY_DRAFT_DETAIL,
+        {
+            "id": draft_id,
+            "locationId": LOCATION_ID,
+            "poNamespace": PO_METAFIELD_NAMESPACE,
+            "poKey": PO_METAFIELD_KEY,
+        },
+    )["draftOrder"]
+
+    if not draft:
+        logger.info("Draft not found: %s", draft_id)
+        return "skipped"
+
     if DRAFT_ORDER_NAMES:
         targets = {normalize_draft_name(n) for n in DRAFT_ORDER_NAMES}
         if normalize_draft_name(draft.get("name", "")) not in targets:
-            print(f"{draft.get('name')}: SKIP (not in DRAFT_ORDER_NAMES)")
-            return
+            logger.info("%s: SKIP (not in DRAFT_ORDER_NAMES)", draft.get("name"))
+            return "skipped"
 
-    # Idempotency guard
-    existing_tags = set(draft.get("tags") or [])
+    existing_tags = list(draft.get("tags") or [])
 
-    # Never process child drafts as originals
     if CHILD_TAG in existing_tags:
-        print(f"{draft.get('name')}: SKIP (is a split child; tag '{CHILD_TAG}' present).")
+        logger.info("%s: SKIP (is a split child; tag '%s' present).", draft.get("name"), CHILD_TAG)
         return "skipped"
 
     if IDEMPOTENCY_DONE_TAG in existing_tags:
-        print(f"{draft['name']}: SKIP (already processed; tag '{IDEMPOTENCY_DONE_TAG}' present).")
+        logger.info("%s: SKIP (already processed; tag '%s' present).", draft["name"], IDEMPOTENCY_DONE_TAG)
         return "skipped"
 
     if PROCESSING_TAG in existing_tags:
-        print(f"{draft.get('name')}: SKIP (already in progress; tag '{PROCESSING_TAG}' present).")
+        logger.info("%s: SKIP (already being processed; tag '%s' present).", draft["name"], PROCESSING_TAG)
         return "skipped"
 
-    lines = (draft.get("lineItems") or {}).get("nodes") or []
+    # Claim lock first
+    lock_claimed = claim_processing_lock(draft)
+    if not lock_claimed:
+        logger.info("%s: SKIP (could not claim processing lock).", draft["name"])
+        return "skipped"
 
-    # Snapshot full original lineItems input so we can restore if something goes wrong later.
+    # Refresh draft detail after claiming lock so our tag baseline is accurate
+    draft = gql(
+        QUERY_DRAFT_DETAIL,
+        {
+            "id": draft_id,
+            "locationId": LOCATION_ID,
+            "poNamespace": PO_METAFIELD_NAMESPACE,
+            "poKey": PO_METAFIELD_KEY,
+        },
+    )["draftOrder"]
+
+    existing_tags = list(draft.get("tags") or [])
+
+    lines = (draft.get("lineItems") or {}).get("nodes") or []
     original_full_line_items_input = [build_line_input(l) for l in lines]
 
     buckets: Dict[int, List[Dict[str, Any]]] = {b: [] for b in range(1, MAX_BUCKET + 1)}
@@ -898,13 +906,12 @@ def process_draft(draft_id: str) -> str:
             keep.append(line)
 
     if all(len(v) == 0 for v in buckets.values()):
-        print(f"{draft['name']}: no backorders needed.")
+        logger.info("%s: no backorders needed.", draft["name"])
+        release_processing_lock(draft_id, existing_tags)
         return "skipped"
 
-    # Choose primary lines to keep on original so it remains valid.
     primary_bucket_for_original: Optional[int] = None
     if not keep:
-        # No ship-now lines. Keep smallest non-empty bucket on original.
         non_empty = [b for b, ls in buckets.items() if ls]
         primary_bucket_for_original = min(non_empty) if non_empty else None
         if primary_bucket_for_original is not None:
@@ -912,165 +919,178 @@ def process_draft(draft_id: str) -> str:
             buckets[primary_bucket_for_original] = []
 
     if not keep:
-        # Should not happen, but protect.
-        print(f"{draft['name']}: ERROR — after selection, original would have 0 line items. Skipping.")
+        logger.error("%s: original would have 0 line items after split. Skipping.", draft["name"])
+        release_processing_lock(draft_id, existing_tags)
         return "skipped"
 
     existing_po_meta = (draft.get("po_meta") or {}).get("value")
     base_po = (existing_po_meta or draft.get("poNumber") or "").strip()
     original_po = base_po
-    # Payment terms: capture template id from original (preferred), else fallback env.
-    note_text = (draft.get("note2") or "")
+
+    note_text = draft.get("note2") or ""
     net_days = infer_net_days_from_note(note_text)
     note_terms_template_id = template_id_for_net_days(net_days)
-    # Payment terms: capture template id from original (preferred), else infer from note, else fallback env.
-    original_terms_template_id = payment_terms_template_id_from_draft(draft) or note_terms_template_id or PAYMENT_TERMS_TEMPLATE_ID_FALLBACK
-    if original_terms_template_id:
-        print(f"  Payment terms template id: {original_terms_template_id}")
-    else:
-        print("  Payment terms template id: (none)")
+    original_terms_template_id = (
+        payment_terms_template_id_from_draft(draft)
+        or note_terms_template_id
+        or PAYMENT_TERMS_TEMPLATE_ID_FALLBACK
+    )
 
+    if original_terms_template_id:
+        logger.info("Payment terms template id: %s", original_terms_template_id)
+    else:
+        logger.info("Payment terms template id: (none)")
 
     original_name = draft.get("name")
     original_tags = list(draft.get("tags") or [])
-    original_custom_attributes = (draft.get("customAttributes") or [])
+    original_custom_attributes = draft.get("customAttributes") or []
 
-    print(f"\nProcessing {original_name} (DRY_RUN={DRY_RUN})")
-    newly_created_child_ids: List[Tuple[int,str]] = []  # (bucket, draft_id)
-    print(f"  Original PO: {original_po!r}")
-
-    # Mark the parent draft as in-progress before touching child drafts.
-    if not DRY_RUN:
-        processing_tags = list(original_tags)
-        if PROCESSING_TAG not in processing_tags:
-            processing_tags.append(PROCESSING_TAG)
-        processing_input: Dict[str, Any] = {"tags": processing_tags}
-        print(f"  Marking original as in-progress with tag '{PROCESSING_TAG}'")
-        errs_processing, processing_node = draft_update_return(draft_id, processing_input, label="mark processing")
-        if errs_processing:
-            raise RuntimeError(f"failed to mark original as processing: {errs_processing}")
-        processing_node_tags = set(processing_node.get("tags") or [])
-        if PROCESSING_TAG not in processing_node_tags:
-            raise RuntimeError(f"failed to verify processing tag '{PROCESSING_TAG}' on original")
+    logger.info("")
+    logger.info("Processing %s (DRY_RUN=%s)", original_name, DRY_RUN)
+    logger.info("Original PO: %r", original_po)
     if primary_bucket_for_original is None:
-        print(f"  Original keeps ship-now lines: {len(keep)}")
+        logger.info("Original keeps ship-now lines: %s", len(keep))
     else:
-        print(f"  Original assigned to bucket #{primary_bucket_for_original}: {len(keep)}")
+        logger.info("Original assigned to bucket #%s: %s", primary_bucket_for_original, len(keep))
 
-    # Build additions for linkage
-    ca_add_orig, mf_add_orig = build_linking_fields(base_po=base_po, original_draft_id=draft_id, is_child=False)
+    ca_add_orig, mf_add_orig = build_linking_fields(
+        base_po=base_po,
+        original_draft_id=draft_id,
+        is_child=False,
+    )
+
     bo_draft_ids: Dict[int, str] = {}
-
-    # For children we build per-bucket below    # 1) Create & update backorder drafts
-
-    for bucket, bucket_lines in buckets.items():
-        if not bucket_lines:
-            continue
-
-        # Bucket-level idempotency: reuse existing child draft if present
-        existing_child = None if DRY_RUN else find_existing_child(draft_id, bucket)
-        created_new = False
-
-        if existing_child:
-            dup_id = existing_child["id"]
-            dup_name = existing_child.get("name") or ""
-            print(f"  Child bucket #{bucket}: {len(bucket_lines)} line(s) | PO={build_po_number(original_po, bucket)}")
-            print(f"    Reusing existing child: {dup_name} ({dup_id})")
-        else:
-            dup = draft_duplicate(draft_id)
-            dup_id = dup["id"]
-            created_new = (not DRY_RUN)
-            if created_new:
-                newly_created_child_ids.append((bucket, dup_id))
-            dup_name = dup.get("name") or ""
-            print(f"  Child bucket #{bucket}: {len(bucket_lines)} line(s) | PO={build_po_number(original_po, bucket)}")
-            if DRY_RUN:
-                print("    DRY RUN — would duplicate original and update duplicate lineItems/poNumber/tags/metafield.")
-            else:
-                print(f"    Duplicated: {dup_name} ({dup_id})")
-
-        bo_draft_ids[bucket] = (f"DRY_RUN_BO{bucket}" if DRY_RUN else dup_id)
-
-        # Build tags
-        new_tags = list(original_tags)
-        bucket_tag = f"Backorder #{bucket}"
-        if bucket_tag not in new_tags:
-            new_tags.append(bucket_tag)
-        child_tag = CHILD_TAG
-        if child_tag not in new_tags:
-            new_tags.append(child_tag)
-
-        ca_add_child, mf_add_child = build_linking_fields(
-            base_po=base_po,
-            original_draft_id=draft_id,
-            is_child=True,
-            bucket=bucket,
-        )
-
-        update_input: Dict[str, Any] = {
-            "lineItems": [build_line_input(l) for l in bucket_lines],
-            "poNumber": build_po_number(original_po, bucket),
-            "tags": new_tags,
-            "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add_child),
-            "metafields": mf_add_child,
-        }
-
-        # Ensure payment terms on children if a template id was determined.
-        if SET_PAYMENT_TERMS_ON_CHILDREN and original_terms_template_id:
-            pti = build_payment_terms_input(original_terms_template_id)
-            if pti:
-                update_input["paymentTerms"] = pti        # Update child; on failure, roll back newly created children and abort BEFORE touching original.
-        try:
-            apply_update_with_retries(
-                draft_id=dup_id,
-                input_data=update_input,
-                label=f"child bucket #{bucket}",
-                terms_template_id=original_terms_template_id,
-            )
-        except Exception as e:
-            print(f"    ERROR updating child bucket #{bucket}: {e}")
-            for b, did in reversed(newly_created_child_ids):
-                draft_delete(did, label=f"rollback child bucket #{b}")
-            raise
-
-    # 2) Update original draft with keep lines + idempotency
-    updated_tags = [t for t in original_tags if t != PROCESSING_TAG]
-    if IDEMPOTENCY_DONE_TAG not in updated_tags:
-        updated_tags.append(IDEMPOTENCY_DONE_TAG)
-    if primary_bucket_for_original is not None:
-        primary_tag = f"Backorder #{primary_bucket_for_original}"
-        if primary_tag not in updated_tags:
-            updated_tags.append(primary_tag)
-
-    original_update: Dict[str, Any] = {
-        "lineItems": [build_line_input(l) for l in keep],
-        "tags": updated_tags,
-        "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add_orig),
-        "metafields": mf_add_orig,
-        # Keep original poNumber unchanged.
-    }
-
-    print(f"  Updating original: keep {len(keep)} line(s) + tag '{IDEMPOTENCY_DONE_TAG}'")
-
-    # In DRY_RUN we only print what would happen; do not verify or roll back.
-    if DRY_RUN:
-        draft_update_return(draft_id, original_update, label="original")
-        return "success"
+    newly_created_child_ids: List[Tuple[int, str]] = []
 
     try:
-        updated_node = apply_update_with_retries(draft_id=draft_id, input_data=original_update, label="original", terms_template_id=original_terms_template_id)
+        # 1) Create/update child drafts
+        for bucket, bucket_lines in buckets.items():
+            if not bucket_lines:
+                continue
 
-        # Verify original update using mutation response (fast, no extra query)
+            existing_child = None if DRY_RUN else find_existing_child(draft_id, bucket)
+            created_new = False
+
+            if existing_child:
+                dup_id = existing_child["id"]
+                dup_name = existing_child.get("name") or ""
+                logger.info(
+                    "Child bucket #%s: %s line(s) | PO=%s",
+                    bucket,
+                    len(bucket_lines),
+                    build_po_number(original_po, bucket),
+                )
+                logger.info("Reusing existing child: %s (%s)", dup_name, dup_id)
+            else:
+                dup = draft_duplicate(draft_id)
+                dup_id = dup["id"]
+                created_new = not DRY_RUN
+                if created_new:
+                    newly_created_child_ids.append((bucket, dup_id))
+                dup_name = dup.get("name") or ""
+                logger.info(
+                    "Child bucket #%s: %s line(s) | PO=%s",
+                    bucket,
+                    len(bucket_lines),
+                    build_po_number(original_po, bucket),
+                )
+                if DRY_RUN:
+                    logger.info("DRY RUN — would duplicate original and update duplicate.")
+                else:
+                    logger.info("Duplicated: %s (%s)", dup_name, dup_id)
+
+            bo_draft_ids[bucket] = f"DRY_RUN_BO{bucket}" if DRY_RUN else dup_id
+
+            new_tags = list(original_tags)
+            bucket_tag = f"Backorder #{bucket}"
+            if bucket_tag not in new_tags:
+                new_tags.append(bucket_tag)
+            if CHILD_TAG not in new_tags:
+                new_tags.append(CHILD_TAG)
+
+            ca_add_child, mf_add_child = build_linking_fields(
+                base_po=base_po,
+                original_draft_id=draft_id,
+                is_child=True,
+                bucket=bucket,
+            )
+
+            update_input: Dict[str, Any] = {
+                "lineItems": [build_line_input(l) for l in bucket_lines],
+                "poNumber": build_po_number(original_po, bucket),
+                "tags": new_tags,
+                "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add_child),
+                "metafields": mf_add_child,
+            }
+
+            if SET_PAYMENT_TERMS_ON_CHILDREN and original_terms_template_id:
+                pti = build_payment_terms_input(original_terms_template_id)
+                if pti:
+                    update_input["paymentTerms"] = pti
+
+            try:
+                apply_update_with_retries(
+                    draft_id=dup_id,
+                    input_data=update_input,
+                    label=f"child bucket #{bucket}",
+                    terms_template_id=original_terms_template_id,
+                )
+            except Exception as e:
+                logger.error("ERROR updating child bucket #%s: %s", bucket, e)
+                for b, did in reversed(newly_created_child_ids):
+                    draft_delete(did, label=f"rollback child bucket #{b}")
+                raise
+
+        # 2) Update original draft with keep lines + done tag, and remove processing tag
+        updated_tags = list(original_tags)
+        updated_tags = without_tag(updated_tags, PROCESSING_TAG)
+        if IDEMPOTENCY_DONE_TAG not in updated_tags:
+            updated_tags.append(IDEMPOTENCY_DONE_TAG)
+        if primary_bucket_for_original is not None:
+            primary_tag = f"Backorder #{primary_bucket_for_original}"
+            if primary_tag not in updated_tags:
+                updated_tags.append(primary_tag)
+
+        original_update: Dict[str, Any] = {
+            "lineItems": [build_line_input(l) for l in keep],
+            "tags": updated_tags,
+            "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add_orig),
+            "metafields": mf_add_orig,
+        }
+
+        logger.info(
+            "Updating original: keep %s line(s) + add '%s' + remove '%s'",
+            len(keep),
+            IDEMPOTENCY_DONE_TAG,
+            PROCESSING_TAG,
+        )
+
+        if DRY_RUN:
+            draft_update_return(draft_id, original_update, label="original")
+            return "success"
+
+        updated_node = apply_update_with_retries(
+            draft_id=draft_id,
+            input_data=original_update,
+            label="original",
+            terms_template_id=original_terms_template_id,
+        )
+
         v_tags = set(updated_node.get("tags") or [])
         v_total = get_lineitems_total_count(updated_node)
-        if IDEMPOTENCY_DONE_TAG not in v_tags or PROCESSING_TAG in v_tags or (v_total is not None and v_total != len(keep)):
+        if IDEMPOTENCY_DONE_TAG not in v_tags or PROCESSING_TAG in v_tags or (
+            v_total is not None and v_total != len(keep)
+        ):
             raise RuntimeError(
-                f"post-update verification failed: tag_present={IDEMPOTENCY_DONE_TAG in v_tags} "
+                f"post-update verification failed: "
+                f"done_tag_present={IDEMPOTENCY_DONE_TAG in v_tags} "
                 f"processing_tag_present={PROCESSING_TAG in v_tags} "
                 f"line_count={v_total} expected={len(keep)}"
             )
-        print(f"    Verified original updated: {updated_node.get('name')} | lines={v_total}")
 
+        logger.info("Verified original updated: %s | lines=%s", updated_node.get("name"), v_total)
+
+        # CSV log
         ts = datetime.datetime.now().isoformat(timespec="seconds")
         customer = customer_label_for_log(draft)
         row: Dict[str, str] = {
@@ -1083,34 +1103,62 @@ def process_draft(draft_id: str) -> str:
         for b in range(1, LOG_MAX_BUCKET + 1):
             row[f"BO{b}_draft_id"] = bo_draft_ids.get(b, "")
 
-        upsert_split_log_row(csv_path=Path(__file__).resolve().parent / LOG_CSV_PATH, row=row)
+        upsert_split_log_row(
+            csv_path=Path(__file__).resolve().parent / LOG_CSV_PATH,
+            row=row,
+        )
+
         return "success"
-    except Exception as e:
-        print(f"    ERROR updating/verifying original: {e}")
-        # Roll back any NEW child drafts created in this run (best-effort)
+
+    except Exception:
+        # Remove newly created children
         for b, did in reversed(newly_created_child_ids):
             draft_delete(did, label=f"rollback child bucket #{b}")
 
-        # Restore original lineItems and tags to pre-run state (best-effort)
-        restore_tags = [t for t in original_tags if t not in {IDEMPOTENCY_DONE_TAG, PROCESSING_TAG}]
-        restore_input: Dict[str, Any] = {
-            "lineItems": original_full_line_items_input,
-            "tags": restore_tags,
-            "customAttributes": original_custom_attributes,
-        }
-        errs_restore, _d_restore = draft_update_return(draft_id, restore_input, label="restore original")
-        if errs_restore:
-            print(f"    WARNING: restore original userErrors: {errs_restore}")
+        # Best-effort original restore / cleanup
+        if not DRY_RUN:
+            restore_tags = list(original_tags)
+            restore_tags = without_tag(restore_tags, PROCESSING_TAG)
+            restore_tags = [t for t in restore_tags if t != IDEMPOTENCY_DONE_TAG]
+            restore_input: Dict[str, Any] = {
+                "lineItems": original_full_line_items_input,
+                "tags": restore_tags,
+                "customAttributes": original_custom_attributes,
+            }
+            errs_restore, _ = draft_update_return(
+                draft_id, restore_input, label="restore original"
+            )
+            if errs_restore:
+                logger.warning("Restore original userErrors: %s", errs_restore)
+
         raise
 
 
-
-
 # ----------------------------
-# MAIN
+# MAIN HELPERS
 # ----------------------------
 def chunk_list(items: List[str], size: int) -> List[List[str]]:
-    return [items[i:i+size] for i in range(0, len(items), size)]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def build_open_ended_query() -> str:
+    """
+    Query only drafts we have not already evaluated.
+    Optional lookback keeps recurring GitHub runs bounded.
+    """
+    parts = [
+        "status:open",
+        f"-tag:{IDEMPOTENCY_DONE_TAG}",
+        f"-tag:{CHILD_TAG}",
+        f"-tag:{PROCESSING_TAG}",
+    ]
+
+    if LOOKBACK_DAYS > 0:
+        since = (datetime.datetime.now(timezone.utc) - datetime.timedelta(days=LOOKBACK_DAYS)).date().isoformat()
+        # Using updated_at keeps the recurring run focused on fresh work.
+        parts.append(f"updated_at:>={since}")
+
+    return " ".join(parts)
 
 
 # ----------------------------
@@ -1123,14 +1171,10 @@ def main() -> None:
     scanned = 0
 
     if DRAFT_ORDER_NAMES:
-        # OPTION B (robust): Query Shopify in chunks by draft name, instead of scanning thousands of open drafts.
-        # This avoids missing older drafts when the open-draft list is huge.
-        # We still add status:open to avoid pulling completed drafts.
-        CHUNK_SIZE = 12  # keep query strings comfortably under Shopify limits
+        CHUNK_SIZE = 12
         for chunk in chunk_list(DRAFT_ORDER_NAMES, CHUNK_SIZE):
             name_query = build_draft_name_query(chunk)
-            base_query = build_recent_open_drafts_query()
-            query = f"{base_query} ({name_query})" if name_query else base_query
+            query = f"status:open ({name_query})" if name_query else "status:open"
 
             after = None
             while True:
@@ -1151,10 +1195,12 @@ def main() -> None:
                 if not page_info.get("hasNextPage"):
                     break
     else:
-        # Default: scan a bounded number of open drafts
-        query = build_recent_open_drafts_query()
+        query = build_open_ended_query()
         page_size = min(250, MAX_DRAFTS)
         after = None
+
+        logger.info("Open-ended query: %s", query)
+
         while True:
             resp = gql(QUERY_DRAFTS, {"first": page_size, "after": after, "query": query}).get("draftOrders") or {}
             edges = resp.get("edges") or []
@@ -1179,10 +1225,9 @@ def main() -> None:
                 break
 
     if not collected:
-        print("No drafts found.")
+        logger.info("No drafts found.")
         return
 
-    # De-dupe by ID (chunks can overlap)
     dedup: Dict[str, Dict[str, Any]] = {}
     for d in collected:
         did = d.get("id")
@@ -1193,10 +1238,15 @@ def main() -> None:
     if DRAFT_ORDER_NAMES:
         drafts = [d for d in drafts if normalize_draft_name(d.get("name", "")) in targets]
 
-    print(f"Found {len(drafts)} draft(s) AFTER client-side filter. DRY_RUN={DRY_RUN} (scanned {scanned} draft rows from API)")
+    logger.info(
+        "Found %s draft(s) AFTER client-side filter. DRY_RUN=%s (scanned %s draft rows from API)",
+        len(drafts),
+        DRY_RUN,
+        scanned,
+    )
     if DRAFT_ORDER_NAMES and not drafts:
-        sample = [d.get("name","") for d in list(dedup.values())[:25]]
-        print("Sample of returned drafts:", ", ".join(sample))
+        sample = [d.get("name", "") for d in list(dedup.values())[:25]]
+        logger.info("Sample of returned drafts: %s", ", ".join(sample))
 
     successes: List[str] = []
     skipped: List[str] = []
@@ -1212,20 +1262,21 @@ def main() -> None:
                 successes.append(draft_name)
         except Exception as e:
             failed.append((draft_name, str(e)))
-            print(f"{draft_name}: FAILED — {e}")
+            logger.error("%s: FAILED — %s", draft_name, e)
             continue
 
-    print("\nRun summary")
-    print(f"  SUCCESS: {len(successes)}")
+    logger.info("")
+    logger.info("Run summary")
+    logger.info("SUCCESS: %s", len(successes))
     if successes:
-        print("    " + ", ".join(successes))
-    print(f"  SKIPPED: {len(skipped)}")
+        logger.info("  %s", ", ".join(successes))
+    logger.info("SKIPPED: %s", len(skipped))
     if skipped:
-        print("    " + ", ".join(skipped))
-    print(f"  FAILED: {len(failed)}")
+        logger.info("  %s", ", ".join(skipped))
+    logger.info("FAILED: %s", len(failed))
     if failed:
         for draft_name, err in failed:
-            print(f"    {draft_name}: {err}")
+            logger.info("  %s: %s", draft_name, err)
 
 
 if __name__ == "__main__":
