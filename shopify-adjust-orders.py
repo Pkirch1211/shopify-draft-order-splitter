@@ -19,56 +19,94 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 loaded = load_dotenv(dotenv_path=ENV_PATH, override=True)
 print("Loaded .env:", loaded, "from", str(ENV_PATH))
 
+
+# ----------------------------
+# ENV HELPERS
+# ----------------------------
+def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip() != "":
+            return value.strip()
+    return default
+
+
+def env_bool(*names: str, default: bool = False) -> bool:
+    value = env_first(*names)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(*names: str, default: int) -> int:
+    value = env_first(*names)
+    if value is None:
+        return default
+    return int(str(value).strip())
+
+
+def parse_draft_order_names(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+
+    text = str(raw).strip()
+    if text in {"[]", '[""]', "['']"}:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+
+    if not text:
+        return []
+
+    parts = [x.strip().strip('"').strip("'") for x in text.split(",")]
+    return [x for x in parts if x]
+
+
 # ----------------------------
 # ENV CONFIG
 # ----------------------------
-SHOP = os.getenv("SHOPIFY_SHOP")
-TOKEN = os.getenv("SHOPIFY_ADMIN_ACCESS_TOKEN")
-API_VERSION = os.getenv("SHOPIFY_API_VERSION", os.getenv("API_VERSION", "2025-07"))
-LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID")
+SHOP = env_first("SHOPIFY_SHOP", "SHOPIFY_STORE")
+TOKEN = env_first("SHOPIFY_ADMIN_ACCESS_TOKEN", "SHOPIFY_TOKEN")
+API_VERSION = env_first("SHOPIFY_API_VERSION", "API_VERSION", default="2025-07")
+LOCATION_ID = env_first("SHOPIFY_LOCATION_ID", "LOCATION_ID")
 
-DRAFT_ORDER_NAMES = [
-    x.strip() for x in (os.getenv("DRAFT_ORDER_NAMES") or "").split(",") if x.strip()
-]
+DRAFT_ORDER_NAMES = parse_draft_order_names(env_first("DRAFT_ORDER_NAMES"))
 
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-MAX_DRAFTS = int(os.getenv("MAX_DRAFTS", "250"))
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
-LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
+DRY_RUN = env_bool("DRY_RUN", default=True)
+MAX_DRAFTS = env_int("MAX_DRAFTS", default=250)
+LOOKBACK_DAYS = env_int("LOOKBACK_DAYS", default=3)
+LOG_LEVEL = (env_first("LOG_LEVEL", default="INFO") or "INFO").upper()
 
-PO_SUFFIX_FORMAT = os.getenv("PO_SUFFIX_FORMAT", " - BO{bucket}")
-IDEMPOTENCY_DONE_TAG = os.getenv("IDEMPOTENCY_DONE_TAG", "split-backorder-done")
-PROCESSING_TAG = os.getenv("PROCESSING_TAG", "split-backorder-processing")
-CHILD_TAG = os.getenv("CHILD_TAG", "split-backorder-child")
+PO_SUFFIX_FORMAT = env_first("PO_SUFFIX_FORMAT", default=" - BO{bucket}") or " - BO{bucket}"
+IDEMPOTENCY_DONE_TAG = env_first("IDEMPOTENCY_DONE_TAG", default="split-backorder-done") or "split-backorder-done"
+PROCESSING_TAG = env_first("PROCESSING_TAG", default="split-backorder-processing") or "split-backorder-processing"
+CHILD_TAG = env_first("CHILD_TAG", default="split-backorder-child") or "split-backorder-child"
 
-# Linking fields (optional but recommended)
-LINK_CUSTOM_ATTR_PO_KEY = (os.getenv("LINK_CUSTOM_ATTR_PO_KEY") or "original_poNumber").strip()
-LINK_CUSTOM_ATTR_DRAFTID_KEY = (os.getenv("LINK_CUSTOM_ATTR_DRAFTID_KEY") or "original_draft_id").strip()
+# Linking fields
+LINK_CUSTOM_ATTR_PO_KEY = env_first("LINK_CUSTOM_ATTR_PO_KEY", default="original_poNumber") or "original_poNumber"
+LINK_CUSTOM_ATTR_DRAFTID_KEY = env_first("LINK_CUSTOM_ATTR_DRAFTID_KEY", default="original_draft_id") or "original_draft_id"
 
-LINK_METAFIELD_NAMESPACE = (os.getenv("LINK_METAFIELD_NAMESPACE") or "lifelines").strip()
-LINK_METAFIELD_KEY = (os.getenv("LINK_METAFIELD_KEY") or "original_po_number").strip()
-LINK_METAFIELD_TYPE = (os.getenv("LINK_METAFIELD_TYPE") or "single_line_text_field").strip()
+LINK_METAFIELD_NAMESPACE = env_first("LINK_METAFIELD_NAMESPACE", default="lifelines") or "lifelines"
+LINK_METAFIELD_KEY = env_first("LINK_METAFIELD_KEY", default="original_po_number") or "original_po_number"
+LINK_METAFIELD_TYPE = env_first("LINK_METAFIELD_TYPE", default="single_line_text_field") or "single_line_text_field"
 
-# Preferred metafields for your B2B workflow
-PO_METAFIELD_NAMESPACE = (os.getenv("PO_METAFIELD_NAMESPACE") or "b2b").strip()
-PO_METAFIELD_KEY = (os.getenv("PO_METAFIELD_KEY") or "po_number").strip()
-PO_METAFIELD_TYPE = (os.getenv("PO_METAFIELD_TYPE") or "single_line_text_field").strip()
+PO_METAFIELD_NAMESPACE = env_first("PO_METAFIELD_NAMESPACE", default="b2b") or "b2b"
+PO_METAFIELD_KEY = env_first("PO_METAFIELD_KEY", default="po_number") or "po_number"
+PO_METAFIELD_TYPE = env_first("PO_METAFIELD_TYPE", default="single_line_text_field") or "single_line_text_field"
 
 ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE = (
-    os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE") or "custom"
-).strip()
+    env_first("ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE", default="custom") or "custom"
+)
 ORIGINAL_DRAFT_ID_METAFIELD_KEY = (
-    os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_KEY") or "original_draft_id"
-).strip()
+    env_first("ORIGINAL_DRAFT_ID_METAFIELD_KEY", default="original_draft_id") or "original_draft_id"
+)
 ORIGINAL_DRAFT_ID_METAFIELD_TYPE = (
-    os.getenv("ORIGINAL_DRAFT_ID_METAFIELD_TYPE") or "single_line_text_field"
-).strip()
+    env_first("ORIGINAL_DRAFT_ID_METAFIELD_TYPE", default="single_line_text_field") or "single_line_text_field"
+)
 
-# Payment terms
-PAYMENT_TERMS_TEMPLATE_ID_FALLBACK = (os.getenv("PAYMENT_TERMS_TEMPLATE_ID") or "").strip()
-SET_PAYMENT_TERMS_ON_CHILDREN = (
-    os.getenv("SET_PAYMENT_TERMS_ON_CHILDREN") or "true"
-).lower() == "true"
+PAYMENT_TERMS_TEMPLATE_ID_FALLBACK = env_first("PAYMENT_TERMS_TEMPLATE_ID", default="") or ""
+SET_PAYMENT_TERMS_ON_CHILDREN = env_bool("SET_PAYMENT_TERMS_ON_CHILDREN", default=True)
 
 print("SHOPIFY_SHOP =", SHOP)
 print("API_VERSION  =", API_VERSION)
@@ -79,9 +117,16 @@ print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
 print("PROCESSING_TAG =", PROCESSING_TAG)
 
 if not SHOP or not TOKEN:
-    raise SystemExit("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_ACCESS_TOKEN in .env")
+    raise SystemExit(
+        "Missing shop/token env vars. Accepted names:\n"
+        "  SHOPIFY_SHOP or SHOPIFY_STORE\n"
+        "  SHOPIFY_ADMIN_ACCESS_TOKEN or SHOPIFY_TOKEN"
+    )
 if not LOCATION_ID:
-    raise SystemExit("Missing SHOPIFY_LOCATION_ID in .env")
+    raise SystemExit(
+        "Missing location env var. Accepted names:\n"
+        "  SHOPIFY_LOCATION_ID or LOCATION_ID"
+    )
 
 GRAPHQL_URL = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
 
@@ -93,7 +138,6 @@ logger = logging.getLogger("shopify-draft-order-splitter")
 
 
 def normalize_draft_name(name: str) -> str:
-    """Normalize draft order names for matching, e.g. '#D15476' == 'D15476'."""
     if not name:
         return ""
     s = str(name).strip()
@@ -104,7 +148,6 @@ def normalize_draft_name(name: str) -> str:
 
 
 def build_draft_name_query(names: List[str]) -> str:
-    """Build a robust Shopify draftOrders search query for a list of draft names."""
     vals: List[str] = []
     seen = set()
     for n in names:
@@ -132,13 +175,9 @@ def build_draft_name_query(names: List[str]) -> str:
 
 
 # ----------------------------
-# TAG → BUCKET MAP (from .env)
+# TAG → BUCKET MAP
 # ----------------------------
 def build_tag_bucket_map() -> Dict[str, int]:
-    """
-    Supports ANY number of buckets via PRODUCT_TAG_BUCKET_N environment variables.
-    Also supports comma-separated tags per bucket.
-    """
     mapping: Dict[str, int] = {}
 
     bucket_keys: List[Tuple[int, str]] = []
@@ -164,9 +203,8 @@ def build_tag_bucket_map() -> Dict[str, int]:
 TAG_BUCKET_MAP = build_tag_bucket_map()
 MAX_BUCKET = max([1, *TAG_BUCKET_MAP.values()])
 
-# CSV logging config
-LOG_CSV_PATH = (os.getenv("LOG_CSV_PATH") or "split_drafts_log.csv").strip()
-LOG_MAX_BUCKET_ENV = (os.getenv("LOG_MAX_BUCKET") or "").strip()
+LOG_CSV_PATH = (env_first("LOG_CSV_PATH", default="split_drafts_log.csv") or "split_drafts_log.csv").strip()
+LOG_MAX_BUCKET_ENV = (env_first("LOG_MAX_BUCKET", default="") or "").strip()
 LOG_MAX_BUCKET = int(LOG_MAX_BUCKET_ENV) if LOG_MAX_BUCKET_ENV else max(10, MAX_BUCKET)
 
 print("Loaded TAG_BUCKET_MAP:", TAG_BUCKET_MAP)
@@ -352,7 +390,7 @@ query($first:Int!, $after:String, $query:String, $ns:String!, $key:String!) {
 
 
 # ----------------------------
-# Helpers: Money / Discount / CustomAttributes / Metafields
+# Helpers
 # ----------------------------
 def money_input(m: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not m:
@@ -402,12 +440,6 @@ def build_linking_fields(
     is_child: bool,
     bucket: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Returns (customAttributesAdditions, metafieldsAdditions)
-
-    We always write ORIGINAL_DRAFT_ID metafield so every draft can be traced.
-    We write the PO metafield ONLY on children.
-    """
     base_po = (base_po or "").strip()
     ca_add = [
         {"key": LINK_CUSTOM_ATTR_PO_KEY, "value": base_po},
@@ -441,13 +473,6 @@ def build_linking_fields(
 # INVENTORY CHECK
 # ----------------------------
 def get_available_qty(line: Dict[str, Any]) -> Optional[int]:
-    """
-    Returns available inventory at LOCATION_ID for this line's variant.
-
-    Behavior:
-    - If inventory tracking is OFF, return None.
-    - If tracking is ON/unknown but inventoryLevel is missing, treat as 0.
-    """
     try:
         variant = line.get("variant") or {}
         inv_item = variant.get("inventoryItem") or {}
@@ -473,11 +498,6 @@ def get_available_qty(line: Dict[str, Any]) -> Optional[int]:
 # RULE ENGINE
 # ----------------------------
 def decide_bucket(line: Dict[str, Any]) -> Optional[int]:
-    """
-    Bucket rules:
-    1) Product launch tag bucket wins.
-    2) Else if qty > available at LOCATION_ID => bucket 1.
-    """
     variant = line.get("variant")
     qty = int(line.get("quantity") or 0)
 
@@ -718,9 +738,7 @@ def payment_terms_template_id_from_draft(draft: Dict[str, Any]) -> str:
 def build_payment_terms_input(template_id: str) -> Optional[Dict[str, Any]]:
     if not template_id:
         return None
-    return {
-        "paymentTermsTemplateId": template_id,
-    }
+    return {"paymentTermsTemplateId": template_id}
 
 
 def build_payment_terms_input_with_issue_date(template_id: str) -> Optional[Dict[str, Any]]:
@@ -787,10 +805,6 @@ def without_tag(tags: List[str], tag: str) -> List[str]:
 
 
 def claim_processing_lock(draft: Dict[str, Any]) -> bool:
-    """
-    Best-effort processing tag so repeat runs avoid re-evaluating drafts mid-flight.
-    In DRY_RUN we do not mutate.
-    """
     tags = list(draft.get("tags") or [])
 
     if CHILD_TAG in tags:
@@ -818,9 +832,6 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
 
 
 def release_processing_lock(draft_id: str, tags: List[str]) -> None:
-    """
-    Remove processing tag only. Best-effort cleanup on failure.
-    """
     if DRY_RUN:
         logger.info("DRY RUN — would remove processing tag from %s", draft_id)
         return
@@ -873,13 +884,11 @@ def process_draft(draft_id: str) -> str:
         logger.info("%s: SKIP (already being processed; tag '%s' present).", draft["name"], PROCESSING_TAG)
         return "skipped"
 
-    # Claim lock first
     lock_claimed = claim_processing_lock(draft)
     if not lock_claimed:
         logger.info("%s: SKIP (could not claim processing lock).", draft["name"])
         return "skipped"
 
-    # Refresh draft detail after claiming lock so our tag baseline is accurate
     draft = gql(
         QUERY_DRAFT_DETAIL,
         {
@@ -891,7 +900,6 @@ def process_draft(draft_id: str) -> str:
     )["draftOrder"]
 
     existing_tags = list(draft.get("tags") or [])
-
     lines = (draft.get("lineItems") or {}).get("nodes") or []
     original_full_line_items_input = [build_line_input(l) for l in lines]
 
@@ -963,7 +971,6 @@ def process_draft(draft_id: str) -> str:
     newly_created_child_ids: List[Tuple[int, str]] = []
 
     try:
-        # 1) Create/update child drafts
         for bucket, bucket_lines in buckets.items():
             if not bucket_lines:
                 continue
@@ -1041,7 +1048,6 @@ def process_draft(draft_id: str) -> str:
                     draft_delete(did, label=f"rollback child bucket #{b}")
                 raise
 
-        # 2) Update original draft with keep lines + done tag, and remove processing tag
         updated_tags = list(original_tags)
         updated_tags = without_tag(updated_tags, PROCESSING_TAG)
         if IDEMPOTENCY_DONE_TAG not in updated_tags:
@@ -1090,7 +1096,6 @@ def process_draft(draft_id: str) -> str:
 
         logger.info("Verified original updated: %s | lines=%s", updated_node.get("name"), v_total)
 
-        # CSV log
         ts = datetime.datetime.now().isoformat(timespec="seconds")
         customer = customer_label_for_log(draft)
         row: Dict[str, str] = {
@@ -1111,11 +1116,9 @@ def process_draft(draft_id: str) -> str:
         return "success"
 
     except Exception:
-        # Remove newly created children
         for b, did in reversed(newly_created_child_ids):
             draft_delete(did, label=f"rollback child bucket #{b}")
 
-        # Best-effort original restore / cleanup
         if not DRY_RUN:
             restore_tags = list(original_tags)
             restore_tags = without_tag(restore_tags, PROCESSING_TAG)
@@ -1138,14 +1141,10 @@ def process_draft(draft_id: str) -> str:
 # MAIN HELPERS
 # ----------------------------
 def chunk_list(items: List[str], size: int) -> List[List[str]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
 def build_open_ended_query() -> str:
-    """
-    Query only drafts we have not already evaluated.
-    Optional lookback keeps recurring GitHub runs bounded.
-    """
     parts = [
         "status:open",
         f"-tag:{IDEMPOTENCY_DONE_TAG}",
@@ -1155,7 +1154,6 @@ def build_open_ended_query() -> str:
 
     if LOOKBACK_DAYS > 0:
         since = (datetime.datetime.now(timezone.utc) - datetime.timedelta(days=LOOKBACK_DAYS)).date().isoformat()
-        # Using updated_at keeps the recurring run focused on fresh work.
         parts.append(f"updated_at:>={since}")
 
     return " ".join(parts)
@@ -1171,8 +1169,8 @@ def main() -> None:
     scanned = 0
 
     if DRAFT_ORDER_NAMES:
-        CHUNK_SIZE = 12
-        for chunk in chunk_list(DRAFT_ORDER_NAMES, CHUNK_SIZE):
+        chunk_size = 12
+        for chunk in chunk_list(DRAFT_ORDER_NAMES, chunk_size):
             name_query = build_draft_name_query(chunk)
             query = f"status:open ({name_query})" if name_query else "status:open"
 
