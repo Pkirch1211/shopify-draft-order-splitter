@@ -30,15 +30,47 @@ jobs:
 
       - name: Run draft splitter
         env:
-          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
-          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
-          LOCATION_ID: ${{ secrets.LOCATION_ID }}
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.LOCATION_ID }}
+
           API_VERSION: ${{ vars.API_VERSION }}
           DRY_RUN: ${{ vars.DRY_RUN }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
           LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
-          IDEMPOTENCY_DONE_TAG: ${{ vars.IDEMPOTENCY_DONE_TAG }}
-          CHILD_TAG: ${{ vars.CHILD_TAG }}
-          PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
           MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
+
+          IDEMPOTENCY_DONE_TAG: ${{ vars.IDEMPOTENCY_DONE_TAG }}
+          PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
+          CHILD_TAG: ${{ vars.CHILD_TAG }}
+
+          DRAFT_ORDER_NAMES: ${{ vars.DRAFT_ORDER_NAMES }}
+
+          ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE }}
+          ORIGINAL_DRAFT_ID_METAFIELD_KEY: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_KEY }}
+          ORIGINAL_DRAFT_ID_METAFIELD_TYPE: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_TYPE }}
+
+          PO_METAFIELD_NAMESPACE: ${{ vars.PO_METAFIELD_NAMESPACE }}
+          PO_METAFIELD_KEY: ${{ vars.PO_METAFIELD_KEY }}
+          PO_METAFIELD_TYPE: ${{ vars.PO_METAFIELD_TYPE }}
+
+          PAYMENT_TERMS_TEMPLATE_ID: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET30: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET30 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET60: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET60 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET90: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET90 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET120: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET120 }}
+          SET_PAYMENT_TERMS_ON_CHILDREN: ${{ vars.SET_PAYMENT_TERMS_ON_CHILDREN }}
+
+          PRODUCT_TAG_BUCKET_1: ${{ vars.PRODUCT_TAG_BUCKET_1 }}
+          PRODUCT_TAG_BUCKET_2: ${{ vars.PRODUCT_TAG_BUCKET_2 }}
+          PRODUCT_TAG_BUCKET_3: ${{ vars.PRODUCT_TAG_BUCKET_3 }}
+          PRODUCT_TAG_BUCKET_4: ${{ vars.PRODUCT_TAG_BUCKET_4 }}
+          PRODUCT_TAG_BUCKET_5: ${{ vars.PRODUCT_TAG_BUCKET_5 }}
+          PRODUCT_TAG_BUCKET_6: ${{ vars.PRODUCT_TAG_BUCKET_6 }}
+          PRODUCT_TAG_BUCKET_7: ${{ vars.PRODUCT_TAG_BUCKET_7 }}
+          PRODUCT_TAG_BUCKET_8: ${{ vars.PRODUCT_TAG_BUCKET_8 }}
+          PRODUCT_TAG_BUCKET_9: ${{ vars.PRODUCT_TAG_BUCKET_9 }}
+          PRODUCT_TAG_BUCKET_10: ${{ vars.PRODUCT_TAG_BUCKET_10 }}
+
         run: |
           python shopify-adjust-orders.py
