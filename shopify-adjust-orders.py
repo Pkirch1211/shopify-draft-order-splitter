@@ -95,6 +95,9 @@ PO_METAFIELD_NAMESPACE = env_first("PO_METAFIELD_NAMESPACE", default="b2b") or "
 PO_METAFIELD_KEY = env_first("PO_METAFIELD_KEY", default="po_number") or "po_number"
 PO_METAFIELD_TYPE = env_first("PO_METAFIELD_TYPE", default="single_line_text_field") or "single_line_text_field"
 
+SHIP_DATE_METAFIELD_NAMESPACE = env_first("SHIP_DATE_METAFIELD_NAMESPACE", default="b2b") or "b2b"
+SHIP_DATE_METAFIELD_KEY = env_first("SHIP_DATE_METAFIELD_KEY", default="ship_date") or "ship_date"
+
 ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE = (
     env_first("ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE", default="custom") or "custom"
 )
@@ -283,7 +286,7 @@ query($first:Int!, $after:String, $query:String) {
 """
 
 QUERY_DRAFT_DETAIL = """
-query($id:ID!, $locationId:ID!, $poNamespace: String!, $poKey: String!) {
+query($id:ID!, $locationId:ID!, $poNamespace: String!, $poKey: String!, $shipDateNamespace: String!, $shipDateKey: String!) {
   draftOrder(id:$id) {
     id
     name
@@ -303,6 +306,16 @@ query($id:ID!, $locationId:ID!, $poNamespace: String!, $poKey: String!) {
     customAttributes { key value }
 
     po_meta: metafield(namespace: $poNamespace, key: $poKey) { value }
+    ship_date_meta: metafield(namespace: $shipDateNamespace, key: $shipDateKey) { value }
+
+    metafields(first:250) {
+      nodes {
+        namespace
+        key
+        type
+        value
+      }
+    }
 
     lineItems(first:250) {
       nodes {
@@ -433,6 +446,79 @@ def merge_custom_attributes(existing: List[Dict[str, Any]], additions: List[Dict
     return [{"key": k, "value": v} for k, v in merged.items()]
 
 
+def merge_metafields(existing: List[Dict[str, Any]], additions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for item in existing or []:
+        ns = (item.get("namespace") or "").strip()
+        key = (item.get("key") or "").strip()
+        if not ns or not key:
+            continue
+
+        mf_type = (item.get("type") or "").strip()
+        value = item.get("value")
+        if value is None:
+            continue
+
+        merged[(ns, key)] = {
+            "namespace": ns,
+            "key": key,
+            "type": mf_type,
+            "value": str(value),
+        }
+
+    for item in additions or []:
+        ns = (item.get("namespace") or "").strip()
+        key = (item.get("key") or "").strip()
+        if not ns or not key:
+            continue
+
+        mf_type = (item.get("type") or "").strip()
+        value = item.get("value")
+        if value is None:
+            continue
+
+        merged[(ns, key)] = {
+            "namespace": ns,
+            "key": key,
+            "type": mf_type,
+            "value": str(value),
+        }
+
+    return list(merged.values())
+
+
+def parse_ship_date_value(raw: Optional[str]) -> Optional[datetime.date]:
+    if not raw:
+        return None
+
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    try:
+        if "T" in text:
+            iso_text = text.replace("Z", "+00:00")
+            return datetime.datetime.fromisoformat(iso_text).date()
+        return datetime.date.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def ship_date_is_eligible(raw_ship_date: Optional[str]) -> Tuple[bool, Optional[datetime.date], datetime.date]:
+    ship_date = parse_ship_date_value(raw_ship_date)
+    today = datetime.datetime.now().date()
+    tomorrow = today + datetime.timedelta(days=1)
+
+    if raw_ship_date is None or str(raw_ship_date).strip() == "":
+        return True, None, tomorrow
+
+    if ship_date is None:
+        return False, None, tomorrow
+
+    return ship_date < tomorrow, ship_date, tomorrow
+
+
 def build_linking_fields(
     *,
     base_po: str,
@@ -456,7 +542,7 @@ def build_linking_fields(
     ]
 
     if is_child and base_po and bucket:
-        child_po = f"{base_po}-BO{bucket}"
+        child_po = build_po_number(base_po, bucket)
         mf_add.append(
             {
                 "namespace": PO_METAFIELD_NAMESPACE,
@@ -857,11 +943,31 @@ def process_draft(draft_id: str) -> str:
             "locationId": LOCATION_ID,
             "poNamespace": PO_METAFIELD_NAMESPACE,
             "poKey": PO_METAFIELD_KEY,
+            "shipDateNamespace": SHIP_DATE_METAFIELD_NAMESPACE,
+            "shipDateKey": SHIP_DATE_METAFIELD_KEY,
         },
     )["draftOrder"]
 
     if not draft:
         logger.info("Draft not found: %s", draft_id)
+        return "skipped"
+
+    raw_ship_date = ((draft.get("ship_date_meta") or {}).get("value") or "").strip()
+    ship_ok, parsed_ship_date, tomorrow = ship_date_is_eligible(raw_ship_date)
+
+    if not ship_ok:
+        if raw_ship_date:
+            logger.info(
+                "%s: SKIP (b2b.ship_date=%r is invalid or not earlier than %s).",
+                draft.get("name"),
+                raw_ship_date,
+                tomorrow.isoformat(),
+            )
+        else:
+            logger.info(
+                "%s: SKIP (invalid b2b.ship_date metafield).",
+                draft.get("name"),
+            )
         return "skipped"
 
     if DRAFT_ORDER_NAMES:
@@ -896,6 +1002,8 @@ def process_draft(draft_id: str) -> str:
             "locationId": LOCATION_ID,
             "poNamespace": PO_METAFIELD_NAMESPACE,
             "poKey": PO_METAFIELD_KEY,
+            "shipDateNamespace": SHIP_DATE_METAFIELD_NAMESPACE,
+            "shipDateKey": SHIP_DATE_METAFIELD_KEY,
         },
     )["draftOrder"]
 
@@ -952,6 +1060,7 @@ def process_draft(draft_id: str) -> str:
     original_name = draft.get("name")
     original_tags = list(draft.get("tags") or [])
     original_custom_attributes = draft.get("customAttributes") or []
+    original_metafields = ((draft.get("metafields") or {}).get("nodes") or [])
 
     logger.info("")
     logger.info("Processing %s (DRY_RUN=%s)", original_name, DRY_RUN)
@@ -1027,7 +1136,7 @@ def process_draft(draft_id: str) -> str:
                 "poNumber": build_po_number(original_po, bucket),
                 "tags": new_tags,
                 "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add_child),
-                "metafields": mf_add_child,
+                "metafields": merge_metafields(original_metafields, mf_add_child),
             }
 
             if SET_PAYMENT_TERMS_ON_CHILDREN and original_terms_template_id:
@@ -1061,7 +1170,7 @@ def process_draft(draft_id: str) -> str:
             "lineItems": [build_line_input(l) for l in keep],
             "tags": updated_tags,
             "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add_orig),
-            "metafields": mf_add_orig,
+            "metafields": merge_metafields(original_metafields, mf_add_orig),
         }
 
         logger.info(
@@ -1127,6 +1236,7 @@ def process_draft(draft_id: str) -> str:
                 "lineItems": original_full_line_items_input,
                 "tags": restore_tags,
                 "customAttributes": original_custom_attributes,
+                "metafields": original_metafields,
             }
             errs_restore, _ = draft_update_return(
                 draft_id, restore_input, label="restore original"
