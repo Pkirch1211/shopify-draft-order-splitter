@@ -6,7 +6,7 @@ import datetime
 import logging
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 from dotenv import load_dotenv
@@ -63,6 +63,18 @@ def parse_draft_order_names(raw: Optional[str]) -> List[str]:
     return [x for x in parts if x]
 
 
+def parse_csv_set(raw: Optional[str], *, casefold: bool = False) -> Set[str]:
+    if not raw:
+        return set()
+    vals = []
+    for part in str(raw).split(","):
+        v = part.strip()
+        if not v:
+            continue
+        vals.append(v.casefold() if casefold else v)
+    return set(vals)
+
+
 # ----------------------------
 # ENV CONFIG
 # ----------------------------
@@ -82,6 +94,9 @@ PO_SUFFIX_FORMAT = env_first("PO_SUFFIX_FORMAT", default=" - BO{bucket}") or " -
 IDEMPOTENCY_DONE_TAG = env_first("IDEMPOTENCY_DONE_TAG", default="split-backorder-done") or "split-backorder-done"
 PROCESSING_TAG = env_first("PROCESSING_TAG", default="split-backorder-processing") or "split-backorder-processing"
 CHILD_TAG = env_first("CHILD_TAG", default="split-backorder-child") or "split-backorder-child"
+
+EXCLUDED_CUSTOMERS = parse_csv_set(env_first("EXCLUDED_CUSTOMERS", default=""), casefold=True)
+CLEAR_STALE_PROCESSING_TAGS = env_bool("CLEAR_STALE_PROCESSING_TAGS", default=True)
 
 # Linking fields
 LINK_CUSTOM_ATTR_PO_KEY = env_first("LINK_CUSTOM_ATTR_PO_KEY", default="original_poNumber") or "original_poNumber"
@@ -118,6 +133,8 @@ print("LOCATION_ID =", LOCATION_ID)
 print("DRY_RUN =", DRY_RUN)
 print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
 print("PROCESSING_TAG =", PROCESSING_TAG)
+print("EXCLUDED_CUSTOMERS =", sorted(EXCLUDED_CUSTOMERS))
+print("CLEAR_STALE_PROCESSING_TAGS =", CLEAR_STALE_PROCESSING_TAGS)
 
 if not SHOP or not TOKEN:
     raise SystemExit(
@@ -148,6 +165,10 @@ def normalize_draft_name(name: str) -> str:
     if s.startswith("#"):
         s = s[1:]
     return s.strip().upper()
+
+
+def normalize_customer_name(name: str) -> str:
+    return (name or "").strip().casefold()
 
 
 def build_draft_name_query(names: List[str]) -> str:
@@ -976,6 +997,12 @@ def process_draft(draft_id: str) -> str:
             logger.info("%s: SKIP (not in DRAFT_ORDER_NAMES)", draft.get("name"))
             return "skipped"
 
+    customer_name = customer_label_for_log(draft).strip()
+    customer_name_norm = normalize_customer_name(customer_name)
+    if customer_name_norm and customer_name_norm in EXCLUDED_CUSTOMERS:
+        logger.info("%s: SKIP (excluded customer: %s)", draft.get("name"), customer_name)
+        return "skipped"
+
     existing_tags = list(draft.get("tags") or [])
 
     if CHILD_TAG in existing_tags:
@@ -987,8 +1014,37 @@ def process_draft(draft_id: str) -> str:
         return "skipped"
 
     if PROCESSING_TAG in existing_tags:
-        logger.info("%s: SKIP (already being processed; tag '%s' present).", draft["name"], PROCESSING_TAG)
-        return "skipped"
+        if CLEAR_STALE_PROCESSING_TAGS:
+            logger.info(
+                "%s: stale processing tag found; clearing '%s' and continuing.",
+                draft["name"],
+                PROCESSING_TAG,
+            )
+            release_processing_lock(draft_id, existing_tags)
+
+            draft = gql(
+                QUERY_DRAFT_DETAIL,
+                {
+                    "id": draft_id,
+                    "locationId": LOCATION_ID,
+                    "poNamespace": PO_METAFIELD_NAMESPACE,
+                    "poKey": PO_METAFIELD_KEY,
+                    "shipDateNamespace": SHIP_DATE_METAFIELD_NAMESPACE,
+                    "shipDateKey": SHIP_DATE_METAFIELD_KEY,
+                },
+            )["draftOrder"]
+
+            if not draft:
+                logger.info("Draft not found after clearing stale lock: %s", draft_id)
+                return "skipped"
+
+            existing_tags = list(draft.get("tags") or [])
+            if PROCESSING_TAG in existing_tags:
+                logger.info("%s: SKIP (processing tag still present after clear attempt).", draft["name"])
+                return "skipped"
+        else:
+            logger.info("%s: SKIP (already being processed; tag '%s' present).", draft["name"], PROCESSING_TAG)
+            return "skipped"
 
     lock_claimed = claim_processing_lock(draft)
     if not lock_claimed:
@@ -1259,8 +1315,10 @@ def build_open_ended_query() -> str:
         "status:open",
         f"-tag:{IDEMPOTENCY_DONE_TAG}",
         f"-tag:{CHILD_TAG}",
-        f"-tag:{PROCESSING_TAG}",
     ]
+
+    if not CLEAR_STALE_PROCESSING_TAGS:
+        parts.append(f"-tag:{PROCESSING_TAG}")
 
     if LOOKBACK_DAYS > 0:
         since = (datetime.datetime.now(timezone.utc) - datetime.timedelta(days=LOOKBACK_DAYS)).date().isoformat()
