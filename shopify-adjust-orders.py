@@ -1005,6 +1005,10 @@ def process_draft(draft_id: str) -> str:
 
     existing_tags = list(draft.get("tags") or [])
 
+    if "needs-review" in existing_tags:
+        logger.info("%s: SKIP (tag 'needs-review' present).", draft.get("name"))
+        return "skipped"
+
     if CHILD_TAG in existing_tags:
         logger.info("%s: SKIP (is a split child; tag '%s' present).", draft.get("name"), CHILD_TAG)
         return "skipped"
@@ -1039,6 +1043,9 @@ def process_draft(draft_id: str) -> str:
                 return "skipped"
 
             existing_tags = list(draft.get("tags") or [])
+            if "needs-review" in existing_tags:
+                logger.info("%s: SKIP (tag 'needs-review' present after refresh).", draft.get("name"))
+                return "skipped"
             if PROCESSING_TAG in existing_tags:
                 logger.info("%s: SKIP (processing tag still present after clear attempt).", draft["name"])
                 return "skipped"
@@ -1064,6 +1071,12 @@ def process_draft(draft_id: str) -> str:
     )["draftOrder"]
 
     existing_tags = list(draft.get("tags") or [])
+
+    if "needs-review" in existing_tags:
+        logger.info("%s: SKIP (tag 'needs-review' present after lock/reload).", draft.get("name"))
+        release_processing_lock(draft_id, existing_tags)
+        return "skipped"
+
     lines = (draft.get("lineItems") or {}).get("nodes") or []
     original_full_line_items_input = [build_line_input(l) for l in lines]
 
@@ -1315,6 +1328,7 @@ def build_open_ended_query() -> str:
         "status:open",
         f"-tag:{IDEMPOTENCY_DONE_TAG}",
         f"-tag:{CHILD_TAG}",
+        "-tag:needs-review",
     ]
 
     if not CLEAR_STALE_PROCESSING_TAGS:
