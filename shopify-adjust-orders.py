@@ -94,6 +94,7 @@ PO_SUFFIX_FORMAT = env_first("PO_SUFFIX_FORMAT", default=" - BO{bucket}") or " -
 IDEMPOTENCY_DONE_TAG = env_first("IDEMPOTENCY_DONE_TAG", default="split-backorder-done") or "split-backorder-done"
 PROCESSING_TAG = env_first("PROCESSING_TAG", default="split-backorder-processing") or "split-backorder-processing"
 CHILD_TAG = env_first("CHILD_TAG", default="split-backorder-child") or "split-backorder-child"
+NEEDS_REVIEW_TAG = env_first("NEEDS_REVIEW_TAG", default="needs-review") or "needs-review"
 
 EXCLUDED_CUSTOMERS = parse_csv_set(env_first("EXCLUDED_CUSTOMERS", default=""), casefold=True)
 CLEAR_STALE_PROCESSING_TAGS = env_bool("CLEAR_STALE_PROCESSING_TAGS", default=True)
@@ -133,6 +134,7 @@ print("LOCATION_ID =", LOCATION_ID)
 print("DRY_RUN =", DRY_RUN)
 print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
 print("PROCESSING_TAG =", PROCESSING_TAG)
+print("NEEDS_REVIEW_TAG =", NEEDS_REVIEW_TAG)
 print("EXCLUDED_CUSTOMERS =", sorted(EXCLUDED_CUSTOMERS))
 print("CLEAR_STALE_PROCESSING_TAGS =", CLEAR_STALE_PROCESSING_TAGS)
 
@@ -911,6 +913,40 @@ def without_tag(tags: List[str], tag: str) -> List[str]:
     return [t for t in (tags or []) if t != tag]
 
 
+def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bool:
+    desired_tags = list(tags or [])
+    if NEEDS_REVIEW_TAG not in desired_tags:
+        desired_tags.append(NEEDS_REVIEW_TAG)
+    desired_tags = without_tag(desired_tags, PROCESSING_TAG)
+
+    if DRY_RUN:
+        logger.info(
+            "DRY RUN — would tag %s with '%s'%s",
+            draft_id,
+            NEEDS_REVIEW_TAG,
+            f" ({reason})" if reason else "",
+        )
+        return True
+
+    errs, updated = draft_update_return(
+        draft_id,
+        {"tags": desired_tags},
+        label=f"tag {NEEDS_REVIEW_TAG}",
+    )
+    if errs:
+        logger.warning(
+            "Could not tag %s with '%s'%s: %s",
+            draft_id,
+            NEEDS_REVIEW_TAG,
+            f" ({reason})" if reason else "",
+            errs,
+        )
+        return False
+
+    updated_tags = set(updated.get("tags") or [])
+    return NEEDS_REVIEW_TAG in updated_tags
+
+
 def claim_processing_lock(draft: Dict[str, Any]) -> bool:
     tags = list(draft.get("tags") or [])
 
@@ -919,6 +955,8 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
     if IDEMPOTENCY_DONE_TAG in tags:
         return False
     if PROCESSING_TAG in tags:
+        return False
+    if NEEDS_REVIEW_TAG in tags:
         return False
 
     if DRY_RUN:
@@ -932,6 +970,33 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
         label="claim processing lock",
     )
     if errs:
+        msg_join = " | ".join((e.get("message", "") or "") for e in errs).lower()
+
+        if "no longer available" in msg_join:
+            logger.info(
+                "%s: product unavailable while claiming lock; attempting to tag '%s'.",
+                draft.get("name"),
+                NEEDS_REVIEW_TAG,
+            )
+            tagged = try_tag_needs_review(
+                draft["id"],
+                tags,
+                reason="product no longer available",
+            )
+            if tagged:
+                logger.info(
+                    "%s: tagged '%s' and skipping.",
+                    draft.get("name"),
+                    NEEDS_REVIEW_TAG,
+                )
+            else:
+                logger.warning(
+                    "%s: could not be auto-tagged '%s' because Shopify rejected the tag update too.",
+                    draft.get("name"),
+                    NEEDS_REVIEW_TAG,
+                )
+            return False
+
         raise RuntimeError(f"Failed to claim processing lock: {errs}")
 
     updated_tags = set(updated.get("tags") or [])
@@ -1005,8 +1070,8 @@ def process_draft(draft_id: str) -> str:
 
     existing_tags = list(draft.get("tags") or [])
 
-    if "needs-review" in existing_tags:
-        logger.info("%s: SKIP (tag 'needs-review' present).", draft.get("name"))
+    if NEEDS_REVIEW_TAG in existing_tags:
+        logger.info("%s: SKIP (tag '%s' present).", draft.get("name"), NEEDS_REVIEW_TAG)
         return "skipped"
 
     if CHILD_TAG in existing_tags:
@@ -1043,8 +1108,8 @@ def process_draft(draft_id: str) -> str:
                 return "skipped"
 
             existing_tags = list(draft.get("tags") or [])
-            if "needs-review" in existing_tags:
-                logger.info("%s: SKIP (tag 'needs-review' present after refresh).", draft.get("name"))
+            if NEEDS_REVIEW_TAG in existing_tags:
+                logger.info("%s: SKIP (tag '%s' present after refresh).", draft.get("name"), NEEDS_REVIEW_TAG)
                 return "skipped"
             if PROCESSING_TAG in existing_tags:
                 logger.info("%s: SKIP (processing tag still present after clear attempt).", draft["name"])
@@ -1072,8 +1137,8 @@ def process_draft(draft_id: str) -> str:
 
     existing_tags = list(draft.get("tags") or [])
 
-    if "needs-review" in existing_tags:
-        logger.info("%s: SKIP (tag 'needs-review' present after lock/reload).", draft.get("name"))
+    if NEEDS_REVIEW_TAG in existing_tags:
+        logger.info("%s: SKIP (tag '%s' present after lock/reload).", draft.get("name"), NEEDS_REVIEW_TAG)
         release_processing_lock(draft_id, existing_tags)
         return "skipped"
 
@@ -1328,7 +1393,7 @@ def build_open_ended_query() -> str:
         "status:open",
         f"-tag:{IDEMPOTENCY_DONE_TAG}",
         f"-tag:{CHILD_TAG}",
-        "-tag:needs-review",
+        f"-tag:{NEEDS_REVIEW_TAG}",
     ]
 
     if not CLEAR_STALE_PROCESSING_TAGS:
