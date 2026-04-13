@@ -1251,7 +1251,8 @@ def process_draft(draft_id: str) -> str:
 
             bo_draft_ids[bucket] = f"DRY_RUN_BO{bucket}" if DRY_RUN else dup_id
 
-            new_tags = list(original_tags)
+            # FIX: explicitly strip PROCESSING_TAG so it is never inherited by children
+            new_tags = without_tag(list(original_tags), PROCESSING_TAG)
             bucket_tag = f"Backorder #{bucket}"
             if bucket_tag not in new_tags:
                 new_tags.append(bucket_tag)
