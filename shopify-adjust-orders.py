@@ -173,6 +173,30 @@ def normalize_customer_name(name: str) -> str:
     return (name or "").strip().casefold()
 
 
+def candidate_customer_labels(draft: Dict[str, Any]) -> List[str]:
+    vals: List[str] = []
+
+    for addr_key in ("shippingAddress", "billingAddress"):
+        addr = draft.get(addr_key) or {}
+        for field in ("company", "name"):
+            v = (addr.get(field) or "").strip()
+            if v:
+                vals.append(v)
+
+    email = (draft.get("email") or "").strip()
+    if email:
+        vals.append(email)
+
+    seen: Set[str] = set()
+    out: List[str] = []
+    for v in vals:
+        key = v.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
 def build_draft_name_query(names: List[str]) -> str:
     vals: List[str] = []
     seen = set()
@@ -1062,10 +1086,24 @@ def process_draft(draft_id: str) -> str:
             logger.info("%s: SKIP (not in DRAFT_ORDER_NAMES)", draft.get("name"))
             return "skipped"
 
-    customer_name = customer_label_for_log(draft).strip()
-    customer_name_norm = normalize_customer_name(customer_name)
-    if customer_name_norm and customer_name_norm in EXCLUDED_CUSTOMERS:
-        logger.info("%s: SKIP (excluded customer: %s)", draft.get("name"), customer_name)
+    customer_candidates = candidate_customer_labels(draft)
+    customer_candidate_norms = {normalize_customer_name(x) for x in customer_candidates}
+    matched_excluded_customers = sorted(customer_candidate_norms.intersection(EXCLUDED_CUSTOMERS))
+
+    logger.info(
+        "%s: customer candidates=%s | excluded=%s",
+        draft.get("name"),
+        customer_candidates,
+        sorted(EXCLUDED_CUSTOMERS),
+    )
+
+    if matched_excluded_customers:
+        logger.info(
+            "%s: SKIP (excluded customer matched: %s | candidates=%s)",
+            draft.get("name"),
+            ", ".join(matched_excluded_customers),
+            customer_candidates,
+        )
         return "skipped"
 
     existing_tags = list(draft.get("tags") or [])
