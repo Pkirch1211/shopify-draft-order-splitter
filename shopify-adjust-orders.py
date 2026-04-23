@@ -75,6 +75,20 @@ def parse_csv_set(raw: Optional[str], *, casefold: bool = False) -> Set[str]:
     return set(vals)
 
 
+def normalize_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = text.strip().casefold()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def contains_any_substring(haystack: str, needles: Set[str]) -> List[str]:
+    if not haystack or not needles:
+        return []
+    matched = [n for n in sorted(needles) if n and n in haystack]
+    return matched
+
+
 # ----------------------------
 # ENV CONFIG
 # ----------------------------
@@ -96,7 +110,28 @@ PROCESSING_TAG = env_first("PROCESSING_TAG", default="split-backorder-processing
 CHILD_TAG = env_first("CHILD_TAG", default="split-backorder-child") or "split-backorder-child"
 NEEDS_REVIEW_TAG = env_first("NEEDS_REVIEW_TAG", default="needs-review") or "needs-review"
 
+# Exact-match exclusions (normalized)
 EXCLUDED_CUSTOMERS = parse_csv_set(env_first("EXCLUDED_CUSTOMERS", default=""), casefold=True)
+
+# Additional substring exclusions for broader safety.
+# You can override/extend in .env, but these defaults intentionally include Faire-like markers.
+DEFAULT_EXCLUDED_SUBSTRINGS = {
+    "faire",
+    "faire marketplace",
+    "customer samples",
+    "tjx canada",
+    "tjx companies",
+    "replacements and customer care",
+    "replacements customer care customer care",
+    "noreen batdorf",
+    "norman's hallmark",
+}
+EXCLUDED_CUSTOMER_SUBSTRINGS = parse_csv_set(
+    env_first("EXCLUDED_CUSTOMER_SUBSTRINGS", default=""),
+    casefold=True,
+) or set()
+EXCLUDED_CUSTOMER_SUBSTRINGS = set(EXCLUDED_CUSTOMER_SUBSTRINGS).union(DEFAULT_EXCLUDED_SUBSTRINGS)
+
 CLEAR_STALE_PROCESSING_TAGS = env_bool("CLEAR_STALE_PROCESSING_TAGS", default=True)
 
 # Linking fields
@@ -136,6 +171,7 @@ print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
 print("PROCESSING_TAG =", PROCESSING_TAG)
 print("NEEDS_REVIEW_TAG =", NEEDS_REVIEW_TAG)
 print("EXCLUDED_CUSTOMERS =", sorted(EXCLUDED_CUSTOMERS))
+print("EXCLUDED_CUSTOMER_SUBSTRINGS =", sorted(EXCLUDED_CUSTOMER_SUBSTRINGS))
 print("CLEAR_STALE_PROCESSING_TAGS =", CLEAR_STALE_PROCESSING_TAGS)
 
 if not SHOP or not TOKEN:
@@ -170,7 +206,7 @@ def normalize_draft_name(name: str) -> str:
 
 
 def normalize_customer_name(name: str) -> str:
-    return (name or "").strip().casefold()
+    return normalize_text(name)
 
 
 def candidate_customer_labels(draft: Dict[str, Any]) -> List[str]:
@@ -195,6 +231,80 @@ def candidate_customer_labels(draft: Dict[str, Any]) -> List[str]:
             seen.add(key)
             out.append(v)
     return out
+
+
+def build_exclusion_haystack(draft: Dict[str, Any]) -> Tuple[List[str], str]:
+    vals: List[str] = []
+
+    vals.extend(candidate_customer_labels(draft))
+
+    po_number = (draft.get("poNumber") or "").strip()
+    if po_number:
+        vals.append(po_number)
+
+    note_text = (draft.get("note2") or "").strip()
+    if note_text:
+        vals.append(note_text)
+
+    for tag in draft.get("tags") or []:
+        if tag:
+            vals.append(str(tag).strip())
+
+    for item in draft.get("customAttributes") or []:
+        k = (item.get("key") or "").strip()
+        v = (item.get("value") or "").strip()
+        if k:
+            vals.append(k)
+        if v:
+            vals.append(v)
+
+    for item in ((draft.get("metafields") or {}).get("nodes") or []):
+        ns = (item.get("namespace") or "").strip()
+        key = (item.get("key") or "").strip()
+        value = (item.get("value") or "").strip()
+        if ns:
+            vals.append(ns)
+        if key:
+            vals.append(key)
+        if value:
+            vals.append(value)
+
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for v in vals:
+        nv = normalize_text(v)
+        if not nv or nv in seen:
+            continue
+        seen.add(nv)
+        deduped.append(v)
+
+    normalized_blob = " | ".join(normalize_text(v) for v in deduped if normalize_text(v))
+    return deduped, normalized_blob
+
+
+def is_excluded_draft(draft: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    customer_candidates = candidate_customer_labels(draft)
+    customer_candidate_norms = {normalize_customer_name(x) for x in customer_candidates}
+
+    exact_matches = sorted(customer_candidate_norms.intersection(EXCLUDED_CUSTOMERS))
+
+    haystack_vals, haystack_blob = build_exclusion_haystack(draft)
+    substring_matches = contains_any_substring(haystack_blob, EXCLUDED_CUSTOMER_SUBSTRINGS)
+
+    matched_reasons: List[str] = []
+    if exact_matches:
+        matched_reasons.append(f"exact customer match: {', '.join(exact_matches)}")
+    if substring_matches:
+        matched_reasons.append(f"substring match: {', '.join(substring_matches)}")
+
+    details = {
+        "customer_candidates": customer_candidates,
+        "exact_matches": exact_matches,
+        "substring_matches": substring_matches,
+        "haystack_values": haystack_vals,
+        "matched_reasons": matched_reasons,
+    }
+    return bool(exact_matches or substring_matches), details
 
 
 def build_draft_name_query(names: List[str]) -> str:
@@ -1086,23 +1196,21 @@ def process_draft(draft_id: str) -> str:
             logger.info("%s: SKIP (not in DRAFT_ORDER_NAMES)", draft.get("name"))
             return "skipped"
 
-    customer_candidates = candidate_customer_labels(draft)
-    customer_candidate_norms = {normalize_customer_name(x) for x in customer_candidates}
-    matched_excluded_customers = sorted(customer_candidate_norms.intersection(EXCLUDED_CUSTOMERS))
+    excluded, exclusion_details = is_excluded_draft(draft)
 
     logger.info(
-        "%s: customer candidates=%s | excluded=%s",
+        "%s: exclusion candidates=%s | exact_matches=%s | substring_matches=%s",
         draft.get("name"),
-        customer_candidates,
-        sorted(EXCLUDED_CUSTOMERS),
+        exclusion_details["customer_candidates"],
+        exclusion_details["exact_matches"],
+        exclusion_details["substring_matches"],
     )
 
-    if matched_excluded_customers:
+    if excluded:
         logger.info(
-            "%s: SKIP (excluded customer matched: %s | candidates=%s)",
+            "%s: SKIP (excluded draft matched: %s)",
             draft.get("name"),
-            ", ".join(matched_excluded_customers),
-            customer_candidates,
+            " ; ".join(exclusion_details["matched_reasons"]) or "excluded signal found",
         )
         return "skipped"
 
@@ -1145,6 +1253,16 @@ def process_draft(draft_id: str) -> str:
                 logger.info("Draft not found after clearing stale lock: %s", draft_id)
                 return "skipped"
 
+            # Re-check exclusion after refresh too.
+            excluded, exclusion_details = is_excluded_draft(draft)
+            if excluded:
+                logger.info(
+                    "%s: SKIP after refresh (excluded draft matched: %s)",
+                    draft.get("name"),
+                    " ; ".join(exclusion_details["matched_reasons"]) or "excluded signal found",
+                )
+                return "skipped"
+
             existing_tags = list(draft.get("tags") or [])
             if NEEDS_REVIEW_TAG in existing_tags:
                 logger.info("%s: SKIP (tag '%s' present after refresh).", draft.get("name"), NEEDS_REVIEW_TAG)
@@ -1174,6 +1292,16 @@ def process_draft(draft_id: str) -> str:
     )["draftOrder"]
 
     existing_tags = list(draft.get("tags") or [])
+
+    excluded, exclusion_details = is_excluded_draft(draft)
+    if excluded:
+        logger.info(
+            "%s: SKIP after lock/reload (excluded draft matched: %s)",
+            draft.get("name"),
+            " ; ".join(exclusion_details["matched_reasons"]) or "excluded signal found",
+        )
+        release_processing_lock(draft_id, existing_tags)
+        return "skipped"
 
     if NEEDS_REVIEW_TAG in existing_tags:
         logger.info("%s: SKIP (tag '%s' present after lock/reload).", draft.get("name"), NEEDS_REVIEW_TAG)
@@ -1289,7 +1417,7 @@ def process_draft(draft_id: str) -> str:
 
             bo_draft_ids[bucket] = f"DRY_RUN_BO{bucket}" if DRY_RUN else dup_id
 
-            # FIX: explicitly strip PROCESSING_TAG so it is never inherited by children
+            # Never inherit processing tag onto children.
             new_tags = without_tag(list(original_tags), PROCESSING_TAG)
             bucket_tag = f"Backorder #{bucket}"
             if bucket_tag not in new_tags:
