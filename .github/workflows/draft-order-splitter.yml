@@ -32,12 +32,14 @@ jobs:
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
           API_VERSION: ${{ vars.API_VERSION }}
           EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
         run: |
           echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
           echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
           echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
           echo "API_VERSION -> ${API_VERSION:-MISSING}"
           echo "EXCLUDED_CUSTOMERS -> ${EXCLUDED_CUSTOMERS:-MISSING}"
+          echo "EXCLUDED_CUSTOMER_SUBSTRINGS -> ${EXCLUDED_CUSTOMER_SUBSTRINGS:-MISSING}"
 
       - name: Run draft splitter
         env:
@@ -51,6 +53,7 @@ jobs:
           LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
           MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
           EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
 
           IDEMPOTENCY_DONE_TAG: ${{ vars.IDEMPOTENCY_DONE_TAG }}
           PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
