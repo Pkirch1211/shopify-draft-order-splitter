@@ -110,6 +110,24 @@ PROCESSING_TAG = env_first("PROCESSING_TAG", default="split-backorder-processing
 CHILD_TAG = env_first("CHILD_TAG", default="split-backorder-child") or "split-backorder-child"
 NEEDS_REVIEW_TAG = env_first("NEEDS_REVIEW_TAG", default="needs-review") or "needs-review"
 
+# Tags that can cause other automations to convert a draft into an order.
+# These are removed before duplicating so an orphan duplicate cannot inherit
+# a converter trigger tag if Shopify creates the duplicate but the API response
+# is lost before this script can update/tag the child.
+CONVERSION_TRIGGER_TAGS = parse_csv_set(
+    env_first("CONVERSION_TRIGGER_TAGS", default="instock-ready"),
+    casefold=False,
+)
+LEGACY_CHILD_TAGS = parse_csv_set(
+    env_first("LEGACY_CHILD_TAGS", default="partial-instock-child"),
+    casefold=False,
+)
+ORDER_SUBMITTED_TAG = env_first("ORDER_SUBMITTED_TAG", default="order-submitted") or "order-submitted"
+
+# When true, a draft that appears to already have been handled by another
+# partial/backorder automation is tagged for review instead of being split.
+SKIP_LEGACY_PARTIAL_CHILDREN = env_bool("SKIP_LEGACY_PARTIAL_CHILDREN", default=True)
+
 # Exact-match exclusions (normalized)
 EXCLUDED_CUSTOMERS = parse_csv_set(env_first("EXCLUDED_CUSTOMERS", default=""), casefold=True)
 
@@ -170,6 +188,10 @@ print("DRY_RUN =", DRY_RUN)
 print("LOOKBACK_DAYS =", LOOKBACK_DAYS)
 print("PROCESSING_TAG =", PROCESSING_TAG)
 print("NEEDS_REVIEW_TAG =", NEEDS_REVIEW_TAG)
+print("CONVERSION_TRIGGER_TAGS =", sorted(CONVERSION_TRIGGER_TAGS))
+print("LEGACY_CHILD_TAGS =", sorted(LEGACY_CHILD_TAGS))
+print("ORDER_SUBMITTED_TAG =", ORDER_SUBMITTED_TAG)
+print("SKIP_LEGACY_PARTIAL_CHILDREN =", SKIP_LEGACY_PARTIAL_CHILDREN)
 print("EXCLUDED_CUSTOMERS =", sorted(EXCLUDED_CUSTOMERS))
 print("EXCLUDED_CUSTOMER_SUBSTRINGS =", sorted(EXCLUDED_CUSTOMER_SUBSTRINGS))
 print("CLEAR_STALE_PROCESSING_TAGS =", CLEAR_STALE_PROCESSING_TAGS)
@@ -549,8 +571,26 @@ query($first:Int!, $after:String, $query:String, $ns:String!, $key:String!) {
       node {
         id
         name
+        poNumber
         tags
         link: metafield(namespace:$ns, key:$key) { value }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+QUERY_FIND_POSSIBLE_LEGACY_CHILD = """
+query($first:Int!, $after:String, $query:String) {
+  draftOrders(first:$first, after:$after, query:$query, reverse:true) {
+    edges {
+      cursor
+      node {
+        id
+        name
+        poNumber
+        tags
       }
     }
     pageInfo { hasNextPage endCursor }
@@ -805,7 +845,11 @@ def draft_duplicate(original_id: str) -> Dict[str, Any]:
     if DRY_RUN:
         return {"id": "DRY_RUN_DUPLICATE", "name": "DRY_RUN_DUPLICATE"}
 
-    res = gql(MUTATION_DUPLICATE, {"id": original_id})["draftOrderDuplicate"]
+    # CRITICAL SAFETY RULE:
+    # draftOrderDuplicate is non-idempotent. If Shopify creates the duplicate but
+    # the HTTP response is lost, retrying this mutation can create a second draft.
+    # Therefore this mutation must not use the generic gql() retry loop.
+    res = gql(MUTATION_DUPLICATE, {"id": original_id}, attempts=1)["draftOrderDuplicate"]
     errs = res.get("userErrors") or []
     if errs:
         raise RuntimeError(f"draftOrderDuplicate userErrors: {errs}")
@@ -846,7 +890,15 @@ def draft_delete(draft_id: str, label: str) -> None:
 # ----------------------------
 # CHILD LOOKUP
 # ----------------------------
-def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[str, str]]:
+def po_values_match(actual: Optional[str], expected: Optional[str]) -> bool:
+    def norm(v: Optional[str]) -> str:
+        return (v or "").strip().lstrip("#").replace(" ", "").casefold()
+
+    return bool(norm(actual) and norm(actual) == norm(expected))
+
+
+def find_existing_child(original_draft_id: str, bucket: int, expected_po: Optional[str] = None) -> Optional[Dict[str, str]]:
+    # First look for the current splitter's fully-linked children.
     q = f'tag:"Backorder #{bucket}" tag:{CHILD_TAG} status:open'
     after = None
     while True:
@@ -867,6 +919,8 @@ def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[st
             link = node.get("link") or {}
             if (link.get("value") or "") == original_draft_id:
                 return {"id": node.get("id", ""), "name": node.get("name", "")}
+            if expected_po and po_values_match(node.get("poNumber"), expected_po):
+                return {"id": node.get("id", ""), "name": node.get("name", "")}
 
         page = resp.get("pageInfo") or {}
         if not page.get("hasNextPage"):
@@ -874,6 +928,85 @@ def find_existing_child(original_draft_id: str, bucket: int) -> Optional[Dict[st
         after = page.get("endCursor")
         if not after:
             break
+
+    # Fallback: look by PO. This catches partially-created children whose metafield
+    # or tags were never applied because a previous run failed mid-update.
+    if expected_po:
+        q = f'status:open "{expected_po}"'
+        after = None
+        while True:
+            resp = gql(
+                QUERY_FIND_CHILD,
+                {
+                    "first": 50,
+                    "after": after,
+                    "query": q,
+                    "ns": ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE,
+                    "key": ORIGINAL_DRAFT_ID_METAFIELD_KEY,
+                },
+            ).get("draftOrders") or {}
+
+            edges = resp.get("edges") or []
+            for e in edges:
+                node = e.get("node") or {}
+                if po_values_match(node.get("poNumber"), expected_po):
+                    return {"id": node.get("id", ""), "name": node.get("name", "")}
+
+            page = resp.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            after = page.get("endCursor")
+            if not after:
+                break
+
+    return None
+
+
+def legacy_child_po_candidates(base_po: str) -> Set[str]:
+    base = (base_po or "").strip().lstrip("#")
+    if not base:
+        return set()
+    return {
+        f"{base}-BO",
+        f"#{base}-BO",
+        f"{base} - BO",
+        f"#{base} - BO",
+    }
+
+
+def find_possible_legacy_child(base_po: str) -> Optional[Dict[str, str]]:
+    if not SKIP_LEGACY_PARTIAL_CHILDREN:
+        return None
+
+    candidates = legacy_child_po_candidates(base_po)
+    if not candidates:
+        return None
+
+    # Search by base PO and inspect exact PO/tag matches locally.
+    q = f'status:open "{base_po}"'
+    after = None
+    while True:
+        resp = gql(
+            QUERY_FIND_POSSIBLE_LEGACY_CHILD,
+            {"first": 50, "after": after, "query": q},
+        ).get("draftOrders") or {}
+
+        edges = resp.get("edges") or []
+        for e in edges:
+            node = e.get("node") or {}
+            tags = set(node.get("tags") or [])
+            po = node.get("poNumber") or ""
+            looks_like_legacy_child = bool(tags.intersection(LEGACY_CHILD_TAGS)) or ORDER_SUBMITTED_TAG in tags
+            if looks_like_legacy_child and any(po_values_match(po, c) for c in candidates):
+                return {"id": node.get("id", ""), "name": node.get("name", ""), "poNumber": po}
+
+        page = resp.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            break
+        after = page.get("endCursor")
+        if not after:
+            break
+
     return None
 
 
@@ -1047,6 +1180,11 @@ def without_tag(tags: List[str], tag: str) -> List[str]:
     return [t for t in (tags or []) if t != tag]
 
 
+def without_tags(tags: List[str], tags_to_remove: Set[str]) -> List[str]:
+    remove = set(tags_to_remove or set())
+    return [t for t in (tags or []) if t not in remove]
+
+
 def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bool:
     desired_tags = list(tags or [])
     if NEEDS_REVIEW_TAG not in desired_tags:
@@ -1097,7 +1235,11 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
         logger.info("DRY RUN — would add processing tag to %s", draft.get("name"))
         return True
 
-    new_tags = with_tag(tags, PROCESSING_TAG)
+    # Add the processing lock and remove converter-trigger tags before any
+    # duplicate mutation. This prevents orphan duplicates from being auto-converted
+    # by a separate order-submission automation if a non-idempotent duplicate call
+    # succeeds on Shopify but fails locally before the child can be cleaned up.
+    new_tags = without_tags(with_tag(tags, PROCESSING_TAG), CONVERSION_TRIGGER_TAGS)
     errs, updated = draft_update_return(
         draft["id"],
         {"tags": new_tags},
@@ -1274,6 +1416,8 @@ def process_draft(draft_id: str) -> str:
             logger.info("%s: SKIP (already being processed; tag '%s' present).", draft["name"], PROCESSING_TAG)
             return "skipped"
 
+    tags_before_lock = list(draft.get("tags") or [])
+
     lock_claimed = claim_processing_lock(draft)
     if not lock_claimed:
         logger.info("%s: SKIP (could not claim processing lock).", draft["name"])
@@ -1323,7 +1467,9 @@ def process_draft(draft_id: str) -> str:
 
     if all(len(v) == 0 for v in buckets.values()):
         logger.info("%s: no backorders needed.", draft["name"])
-        release_processing_lock(draft_id, existing_tags)
+        # Restore pre-lock tags so removing converter-trigger tags during lock
+        # does not accidentally strand a draft that did not need splitting.
+        release_processing_lock(draft_id, tags_before_lock)
         return "skipped"
 
     primary_bucket_for_original: Optional[int] = None
@@ -1342,6 +1488,22 @@ def process_draft(draft_id: str) -> str:
     existing_po_meta = (draft.get("po_meta") or {}).get("value")
     base_po = (existing_po_meta or draft.get("poNumber") or "").strip()
     original_po = base_po
+
+    possible_legacy_child = find_possible_legacy_child(base_po)
+    if possible_legacy_child:
+        logger.error(
+            "%s: possible legacy partial/backorder child already exists for PO %s: %s (%s). Tagging needs review and skipping.",
+            draft.get("name"),
+            base_po,
+            possible_legacy_child.get("name"),
+            possible_legacy_child.get("poNumber"),
+        )
+        try_tag_needs_review(
+            draft_id,
+            existing_tags,
+            reason=f"possible legacy child exists: {possible_legacy_child.get('name')}",
+        )
+        return "skipped"
 
     note_text = draft.get("note2") or ""
     net_days = infer_net_days_from_note(note_text)
@@ -1384,7 +1546,8 @@ def process_draft(draft_id: str) -> str:
             if not bucket_lines:
                 continue
 
-            existing_child = None if DRY_RUN else find_existing_child(draft_id, bucket)
+            expected_child_po = build_po_number(original_po, bucket)
+            existing_child = None if DRY_RUN else find_existing_child(draft_id, bucket, expected_child_po)
             created_new = False
 
             if existing_child:
@@ -1394,11 +1557,26 @@ def process_draft(draft_id: str) -> str:
                     "Child bucket #%s: %s line(s) | PO=%s",
                     bucket,
                     len(bucket_lines),
-                    build_po_number(original_po, bucket),
+                    expected_child_po,
                 )
                 logger.info("Reusing existing child: %s (%s)", dup_name, dup_id)
             else:
-                dup = draft_duplicate(draft_id)
+                try:
+                    dup = draft_duplicate(draft_id)
+                except Exception as e:
+                    logger.error(
+                        "Non-idempotent duplicate mutation failed for %s bucket #%s. Not retrying; tagging original needs review. Error: %s",
+                        original_name,
+                        bucket,
+                        e,
+                    )
+                    try_tag_needs_review(
+                        draft_id,
+                        existing_tags,
+                        reason=f"duplicate mutation failed for bucket #{bucket}",
+                    )
+                    raise
+
                 dup_id = dup["id"]
                 created_new = not DRY_RUN
                 if created_new:
@@ -1408,7 +1586,7 @@ def process_draft(draft_id: str) -> str:
                     "Child bucket #%s: %s line(s) | PO=%s",
                     bucket,
                     len(bucket_lines),
-                    build_po_number(original_po, bucket),
+                    expected_child_po,
                 )
                 if DRY_RUN:
                     logger.info("DRY RUN — would duplicate original and update duplicate.")
@@ -1419,6 +1597,7 @@ def process_draft(draft_id: str) -> str:
 
             # Never inherit processing tag onto children.
             new_tags = without_tag(list(original_tags), PROCESSING_TAG)
+            new_tags = without_tags(new_tags, CONVERSION_TRIGGER_TAGS.union(LEGACY_CHILD_TAGS).union({ORDER_SUBMITTED_TAG}))
             bucket_tag = f"Backorder #{bucket}"
             if bucket_tag not in new_tags:
                 new_tags.append(bucket_tag)
@@ -1460,6 +1639,7 @@ def process_draft(draft_id: str) -> str:
 
         updated_tags = list(original_tags)
         updated_tags = without_tag(updated_tags, PROCESSING_TAG)
+        updated_tags = without_tags(updated_tags, CONVERSION_TRIGGER_TAGS)
         if IDEMPOTENCY_DONE_TAG not in updated_tags:
             updated_tags.append(IDEMPOTENCY_DONE_TAG)
         if primary_bucket_for_original is not None:
