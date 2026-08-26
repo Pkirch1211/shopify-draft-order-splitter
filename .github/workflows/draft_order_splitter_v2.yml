@@ -101,4 +101,4 @@ jobs:
           SET_PAYMENT_TERMS_ON_CHILDREN: ${{ vars.SET_PAYMENT_TERMS_ON_CHILDREN }}
 
         run: |
-          python shopify-adjust-orders-v2.py
+          python shopify-adjust-orders-2.py
