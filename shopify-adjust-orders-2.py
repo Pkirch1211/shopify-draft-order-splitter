@@ -419,6 +419,7 @@ query($id:ID!, $locationId:ID!, $poNamespace: String!, $poKey: String!, $shipDat
           amountV2 { amount currencyCode }
         }
         originalUnitPriceWithCurrency { amount currencyCode }
+        originalUnitPriceSet { shopMoney { amount currencyCode } }
         priceOverride { amount currencyCode }
         variant {
           id
@@ -635,12 +636,25 @@ def is_fully_in_stock(line: Dict[str, Any]) -> bool:
 
 
 def get_line_unit_price(line: Dict[str, Any]) -> Decimal:
+    # Priority order:
+    #   1. priceOverride            -> explicit override, always authoritative
+    #   2. originalUnitPriceWithCurrency -> ONLY ever populated for custom
+    #      (non-variant) line items. Per Shopify's docs, this field is
+    #      "ignored when variantId is provided" — it will always be null
+    #      for real product-variant lines, which is the vast majority of
+    #      what this pipeline processes.
+    #   3. originalUnitPriceSet.shopMoney -> the actual recorded unit price
+    #      for a real product-variant line at order-creation time. This is
+    #      the field that matters for nearly every line this script sees.
     override = line.get("priceOverride") or {}
     if override.get("amount") is not None:
         return to_decimal(override.get("amount"))
-    orig = line.get("originalUnitPriceWithCurrency") or {}
-    if orig.get("amount") is not None:
-        return to_decimal(orig.get("amount"))
+    custom_price = line.get("originalUnitPriceWithCurrency") or {}
+    if custom_price.get("amount") is not None:
+        return to_decimal(custom_price.get("amount"))
+    variant_price = (line.get("originalUnitPriceSet") or {}).get("shopMoney") or {}
+    if variant_price.get("amount") is not None:
+        return to_decimal(variant_price.get("amount"))
     return Decimal("0")
 
 
@@ -710,7 +724,15 @@ def build_line_input(line: Dict[str, Any]) -> Dict[str, Any]:
         if po:
             out["priceOverride"] = po
         else:
+            # originalUnitPriceWithCurrency is null for variant lines by
+            # Shopify's design (it's the custom-line-item price field).
+            # Fall back to originalUnitPriceSet.shopMoney — the actual
+            # recorded price at order-creation time — so a duplicated/split
+            # line preserves what the customer was quoted instead of
+            # silently picking up today's catalog price.
             oup = money_input(line.get("originalUnitPriceWithCurrency"))
+            if not oup:
+                oup = money_input((line.get("originalUnitPriceSet") or {}).get("shopMoney"))
             if oup:
                 out["priceOverride"] = oup
     else:
@@ -858,20 +880,24 @@ def process_draft(draft_id: str) -> str:
     try:
         live = fetch_draft_detail(draft_id)  # re-fetch fresh after claiming the lock
         lines = (live.get("lineItems") or {}).get("nodes") or []
-        # --- TEMPORARY DIAGNOSTIC: dump raw price fields per line. This
-        # exists to root-cause the keep=0/backorder=0 pricing bug seen on
-        # 2026-08-26 (D28884, D29015, D29680 all computed $0 total value).
-        # Safe to remove once the pricing path is confirmed correct.
+        # --- TEMPORARY DIAGNOSTIC: dump raw price fields per line, plus the
+        # resolved unit price after the fix. Root-caused the keep=0/backorder=0
+        # bug from 2026-08-26 (originalUnitPriceWithCurrency is null-by-design
+        # for variant lines; originalUnitPriceSet.shopMoney is the real field).
+        # Safe to remove once a live run confirms nonzero values.
         for _l in lines:
             _variant = _l.get("variant") or {}
             logger.info(
-                "%s: PRICE DEBUG sku=%s qty=%s priceOverride=%r originalUnitPriceWithCurrency=%r",
+                "%s: PRICE DEBUG sku=%s qty=%s priceOverride=%r originalUnitPriceWithCurrency=%r originalUnitPriceSet=%r resolved_unit_price=%s",
                 name,
                 _variant.get("id"),
                 _l.get("quantity"),
                 _l.get("priceOverride"),
                 _l.get("originalUnitPriceWithCurrency"),
+                _l.get("originalUnitPriceSet"),
+                get_line_unit_price(_l),
             )
+
 
         keep_lines, backorder_lines = classify_lines(lines)
 
