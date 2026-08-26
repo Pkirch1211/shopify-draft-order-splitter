@@ -113,7 +113,7 @@ DRAFT_ORDER_NAMES = parse_draft_order_names(env_first("DRAFT_ORDER_NAMES"))
 
 DRY_RUN = env_bool("DRY_RUN", default=True)
 MAX_DRAFTS = env_int("MAX_DRAFTS", default=250)
-LOOKBACK_DAYS = env_int("LOOKBACK_DAYS", default=3)
+LOOKBACK_DAYS = env_int("LOOKBACK_DAYS", default=3)  # DEPRECATED: no longer applied to the open-ended query (see build_open_ended_query). Read only so a stale env var doesn't error; safe to remove from repo vars.
 LOG_LEVEL = (env_first("LOG_LEVEL", default="INFO") or "INFO").upper()
 
 # ----------------------------
@@ -858,6 +858,21 @@ def process_draft(draft_id: str) -> str:
     try:
         live = fetch_draft_detail(draft_id)  # re-fetch fresh after claiming the lock
         lines = (live.get("lineItems") or {}).get("nodes") or []
+        # --- TEMPORARY DIAGNOSTIC: dump raw price fields per line. This
+        # exists to root-cause the keep=0/backorder=0 pricing bug seen on
+        # 2026-08-26 (D28884, D29015, D29680 all computed $0 total value).
+        # Safe to remove once the pricing path is confirmed correct.
+        for _l in lines:
+            _variant = _l.get("variant") or {}
+            logger.info(
+                "%s: PRICE DEBUG sku=%s qty=%s priceOverride=%r originalUnitPriceWithCurrency=%r",
+                name,
+                _variant.get("id"),
+                _l.get("quantity"),
+                _l.get("priceOverride"),
+                _l.get("originalUnitPriceWithCurrency"),
+            )
+
         keep_lines, backorder_lines = classify_lines(lines)
 
         if not backorder_lines:
@@ -1023,6 +1038,18 @@ def build_open_ended_query() -> str:
     # Allow-list first: only drafts explicitly marked as belonging to the
     # new pipeline are ever candidates. Everything else below is a
     # defensive secondary filter, not the primary safeguard.
+    #
+    # INTENTIONALLY NO updated_at:>= FILTER HERE. A draft's updated_at only
+    # changes when something touches its tags/lines — if nobody does, it
+    # freezes at import time. Filtering the query by a rolling updated_at
+    # window means any draft that isn't re-touched within that window
+    # permanently drops out of view, even if its inventory situation
+    # changes later. This is exactly how legacy draft #D28884 got stranded
+    # (fully in-stock at first check, no trace tags left, aged out of the
+    # old script's lookback window, then something sold through — and
+    # nothing ever looked at it again). Every split0-tagged, not-yet-final
+    # draft must be evaluated on every run regardless of age. MAX_DRAFTS
+    # is the correct control for API-call volume, not a date cutoff.
     parts = [
         "status:open",
         f"tag:{ORDER_FLOW_TAG}",
@@ -1031,9 +1058,6 @@ def build_open_ended_query() -> str:
         f"-tag:{NEEDS_REVIEW_TAG}",
         f"-tag:{PROCESSING_TAG}",
     ]
-    if LOOKBACK_DAYS > 0:
-        since = (datetime.datetime.now(timezone.utc) - datetime.timedelta(days=LOOKBACK_DAYS)).date().isoformat()
-        parts.append(f"updated_at:>={since}")
     return " ".join(parts)
 
 
