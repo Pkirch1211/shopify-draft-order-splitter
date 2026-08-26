@@ -1,0 +1,104 @@
+name: Draft Order Splitter V2
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+jobs:
+  run-splitter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Debug env presence
+        shell: bash
+        env:
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+          API_VERSION: ${{ vars.API_VERSION }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
+          MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
+          MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
+        run: |
+          echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
+          echo "API_VERSION -> ${API_VERSION:-MISSING}"
+          echo "DRY_RUN -> ${DRY_RUN:-MISSING}"
+          echo "EXCLUDED_CUSTOMERS -> ${EXCLUDED_CUSTOMERS:-MISSING}"
+          echo "EXCLUDED_CUSTOMER_SUBSTRINGS -> ${EXCLUDED_CUSTOMER_SUBSTRINGS:-MISSING}"
+          echo "MIN_SPLIT_VALUE -> ${MIN_SPLIT_VALUE:-MISSING}"
+          echo "MIN_BACKORDER_HOLD_VALUE -> ${MIN_BACKORDER_HOLD_VALUE:-MISSING}"
+
+      - name: Run draft splitter (v2)
+        env:
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+
+          API_VERSION: ${{ vars.API_VERSION }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
+          MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
+          EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
+
+          DRAFT_ORDER_NAMES: ${{ vars.DRAFT_ORDER_NAMES }}
+
+          # --- v2 dual-gate thresholds ---
+          MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
+          MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
+
+          # --- v2 split outcome / value-band tags ---
+          SPLIT_REMAINDER_TAG: ${{ vars.SPLIT_REMAINDER_TAG }}
+          SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
+          INSTOCK_MINVALUE_TAG: ${{ vars.INSTOCK_MINVALUE_TAG }}
+          BO_MINVALUE_TAG: ${{ vars.BO_MINVALUE_TAG }}
+          ORDER_MINVALUE_TAG: ${{ vars.ORDER_MINVALUE_TAG }}
+
+          # --- v2 allow-list / concurrency / lifecycle tags ---
+          ORDER_FLOW_TAG: ${{ vars.ORDER_FLOW_TAG }}
+          V2_PROCESSING_TAG: ${{ vars.V2_PROCESSING_TAG }}
+          V2_EVAL_DONE_TAG: ${{ vars.V2_EVAL_DONE_TAG }}
+          BACKORDER_CHILD_TAG: ${{ vars.BACKORDER_CHILD_TAG }}
+          NEEDS_REVIEW_TAG: ${{ vars.NEEDS_REVIEW_TAG }}
+          LAUNCH_TAG_PREFIX: ${{ vars.LAUNCH_TAG_PREFIX }}
+
+          ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE }}
+          ORIGINAL_DRAFT_ID_METAFIELD_KEY: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_KEY }}
+          ORIGINAL_DRAFT_ID_METAFIELD_TYPE: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_TYPE }}
+
+          PO_METAFIELD_NAMESPACE: ${{ vars.PO_METAFIELD_NAMESPACE }}
+          PO_METAFIELD_KEY: ${{ vars.PO_METAFIELD_KEY }}
+          PO_METAFIELD_TYPE: ${{ vars.PO_METAFIELD_TYPE }}
+
+          SHIP_DATE_METAFIELD_NAMESPACE: ${{ vars.SHIP_DATE_METAFIELD_NAMESPACE }}
+          SHIP_DATE_METAFIELD_KEY: ${{ vars.SHIP_DATE_METAFIELD_KEY }}
+
+          PAYMENT_TERMS_TEMPLATE_ID: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET30: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET30 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET60: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET60 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET90: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET90 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET120: ${{ vars.PAYMENT_TERMS_TEMPLATE_ID_NET120 }}
+          SET_PAYMENT_TERMS_ON_CHILDREN: ${{ vars.SET_PAYMENT_TERMS_ON_CHILDREN }}
+
+        run: |
+          python shopify-adjust-orders-v2.py
