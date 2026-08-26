@@ -809,6 +809,36 @@ def without_tags(tags: List[str], tags_to_remove: Set[str]) -> List[str]:
     return [t for t in (tags or []) if t not in remove]
 
 
+def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bool:
+    """
+    Ported from v1's escalation pattern. Used for failure modes that should
+    NOT be silently retried forever on the next cron tick — e.g. a variant
+    that's been deleted/archived, or a non-idempotent mutation whose actual
+    outcome on Shopify's side is unknown. Tagging needs-review pulls the
+    draft out of the allow-list query permanently until a human clears it.
+    """
+    desired_tags = list(tags or [])
+    if NEEDS_REVIEW_TAG not in desired_tags:
+        desired_tags.append(NEEDS_REVIEW_TAG)
+    desired_tags = without_tag(desired_tags, PROCESSING_TAG)
+
+    if DRY_RUN:
+        logger.info(
+            "DRY RUN — would tag %s with '%s'%s",
+            draft_id, NEEDS_REVIEW_TAG, f" ({reason})" if reason else "",
+        )
+        return True
+
+    errs, updated = draft_update_return(draft_id, {"tags": desired_tags}, label=f"tag {NEEDS_REVIEW_TAG}")
+    if errs:
+        logger.warning(
+            "Could not tag %s with '%s'%s: %s",
+            draft_id, NEEDS_REVIEW_TAG, f" ({reason})" if reason else "", errs,
+        )
+        return False
+    return NEEDS_REVIEW_TAG in set(updated.get("tags") or [])
+
+
 def claim_processing_lock(draft: Dict[str, Any]) -> bool:
     tags = list(draft.get("tags") or [])
     if PROCESSING_TAG in tags or EVAL_DONE_TAG in tags or NEEDS_REVIEW_TAG in tags:
@@ -821,6 +851,14 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
     new_tags = without_tags(with_tag(tags, PROCESSING_TAG), CONVERSION_TRIGGER_TAGS)
     errs, updated = draft_update_return(draft["id"], {"tags": new_tags}, label="claim processing lock")
     if errs:
+        msg_join = " | ".join((e.get("message", "") or "") for e in errs).lower()
+        if "no longer available" in msg_join:
+            logger.info(
+                "%s: product unavailable while claiming lock; tagging '%s'.",
+                draft.get("name"), NEEDS_REVIEW_TAG,
+            )
+            try_tag_needs_review(draft["id"], tags, reason="product no longer available")
+            return False
         raise RuntimeError(f"Failed to claim processing lock: {errs}")
     return PROCESSING_TAG in set(updated.get("tags") or [])
 
@@ -941,13 +979,30 @@ def process_draft(draft_id: str) -> str:
         original_custom_attributes = live.get("customAttributes") or []
         original_metafields = (live.get("metafields") or {}).get("nodes") or []
 
-        child = draft_duplicate(draft_id)
+        try:
+            child = draft_duplicate(draft_id)
+        except Exception as e:
+            # draftOrderDuplicate is non-idempotent and was deliberately NOT
+            # given the standard retry loop (see draft_duplicate). If it
+            # fails, we genuinely don't know whether Shopify created the
+            # duplicate before the response was lost. Retrying blindly next
+            # run could create a second orphan child. Escalate to a human
+            # instead of leaving this to silently retry on the next cron
+            # tick — mirrors v1's identical off-ramp.
+            logger.error(
+                "%s: non-idempotent duplicate mutation failed; not retrying. Tagging '%s'. Error: %s",
+                name, NEEDS_REVIEW_TAG, e,
+            )
+            try_tag_needs_review(draft_id, original_tags, reason="duplicate mutation failed")
+            processing_released = True
+            raise
+
         try:
             ca_add, mf_add = build_linking_fields(base_po=base_po, original_draft_id=draft_id, is_child=True)
             child_input = {
                 "lineItems": [build_line_input(l) for l in backorder_lines],
                 "poNumber": build_po_number(base_po),
-                "tags": with_tag(without_tags(list(original_tags), CONVERSION_TRIGGER_TAGS), BACKORDER_CHILD_TAG),
+                "tags": with_tag(without_tags(list(original_tags), CONVERSION_TRIGGER_TAGS.union({ORDER_FLOW_TAG, PROCESSING_TAG})), BACKORDER_CHILD_TAG),
                 "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
                 "metafields": merge_metafields(original_metafields, mf_add),
             }
