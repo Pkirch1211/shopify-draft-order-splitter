@@ -144,10 +144,12 @@ SPLIT_150_TAG = env_first("SPLIT_150_TAG", default="split-150") or "split-150"
 LAUNCH_TAG_PREFIX = (env_first("LAUNCH_TAG_PREFIX", default="launch-") or "launch-").casefold()
 
 # Allow-list gate. Only drafts carrying this tag are ever touched by this
-# script. It is stamped onto new drafts at import time by shopify-orders-all-open.py.
-# Legacy drafts (created before this rollout) will never carry it and are
-# therefore invisible to this script, full stop.
-ORDER_FLOW_TAG = env_first("ORDER_FLOW_TAG", default="order-flow-version2") or "order-flow-version2"
+# script. "split0" == not yet split, pairs naturally with the "split1"
+# backorder-child tag below. It is stamped onto new drafts at import time
+# by shopify-orders-all-open.py (not yet implemented there as of this
+# writing). Legacy drafts (created before this rollout) will never carry
+# it and are therefore invisible to this script, full stop.
+ORDER_FLOW_TAG = env_first("ORDER_FLOW_TAG", default="split0") or "split0"
 
 # Concurrency lock, mirrors the pattern used in the legacy script but with its
 # own tag so the two pipelines never contend with each other.
