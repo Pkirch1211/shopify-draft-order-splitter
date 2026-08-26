@@ -1,4 +1,4 @@
-name: Draft Order Splitter V2
+name: Draft Order Splitter
 
 on:
   workflow_dispatch:
@@ -36,6 +36,7 @@ jobs:
           EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
           MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
           MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
+          ORDER_FLOW_TAG: ${{ vars.ORDER_FLOW_TAG }}
         run: |
           echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
           echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
@@ -46,6 +47,7 @@ jobs:
           echo "EXCLUDED_CUSTOMER_SUBSTRINGS -> ${EXCLUDED_CUSTOMER_SUBSTRINGS:-MISSING}"
           echo "MIN_SPLIT_VALUE -> ${MIN_SPLIT_VALUE:-MISSING}"
           echo "MIN_BACKORDER_HOLD_VALUE -> ${MIN_BACKORDER_HOLD_VALUE:-MISSING}"
+          echo "ORDER_FLOW_TAG -> ${ORDER_FLOW_TAG:-MISSING (will default to split0)}"
 
       - name: Run draft splitter (v2)
         env:
@@ -75,6 +77,11 @@ jobs:
           ORDER_MINVALUE_TAG: ${{ vars.ORDER_MINVALUE_TAG }}
 
           # --- v2 allow-list / concurrency / lifecycle tags ---
+          # NOTE: these are v2-specific names and are DIFFERENT from the
+          # legacy v1 repo variables (CHILD_TAG, IDEMPOTENCY_DONE_TAG,
+          # PROCESSING_TAG) already in the repo. Those v1 variables are not
+          # read by this script at all and can stay as-is for the legacy
+          # workflow if it's still running elsewhere.
           ORDER_FLOW_TAG: ${{ vars.ORDER_FLOW_TAG }}
           V2_PROCESSING_TAG: ${{ vars.V2_PROCESSING_TAG }}
           V2_EVAL_DONE_TAG: ${{ vars.V2_EVAL_DONE_TAG }}
