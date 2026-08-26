@@ -880,23 +880,6 @@ def process_draft(draft_id: str) -> str:
     try:
         live = fetch_draft_detail(draft_id)  # re-fetch fresh after claiming the lock
         lines = (live.get("lineItems") or {}).get("nodes") or []
-        # --- TEMPORARY DIAGNOSTIC: dump raw price fields per line, plus the
-        # resolved unit price after the fix. Root-caused the keep=0/backorder=0
-        # bug from 2026-08-26 (originalUnitPriceWithCurrency is null-by-design
-        # for variant lines; originalUnitPriceSet.shopMoney is the real field).
-        # Safe to remove once a live run confirms nonzero values.
-        for _l in lines:
-            _variant = _l.get("variant") or {}
-            logger.info(
-                "%s: PRICE DEBUG sku=%s qty=%s priceOverride=%r originalUnitPriceWithCurrency=%r originalUnitPriceSet=%r resolved_unit_price=%s",
-                name,
-                _variant.get("id"),
-                _l.get("quantity"),
-                _l.get("priceOverride"),
-                _l.get("originalUnitPriceWithCurrency"),
-                _l.get("originalUnitPriceSet"),
-                get_line_unit_price(_l),
-            )
 
 
         keep_lines, backorder_lines = classify_lines(lines)
