@@ -125,17 +125,21 @@ LOG_LEVEL = (env_first("LOG_LEVEL", default="INFO") or "INFO").upper()
 # is worth.
 MIN_SPLIT_VALUE = env_decimal("MIN_SPLIT_VALUE", default="150")
 
-# The GitHub-editable threshold for the backorder ("stays behind") side.
-# This is intentionally LOWER than MIN_SPLIT_VALUE. It only governs whether
-# a split is attempted at all once the keep side has already cleared
-# MIN_SPLIT_VALUE. It does NOT relax the keep-side requirement in any way.
-MIN_BACKORDER_HOLD_VALUE = env_decimal("MIN_BACKORDER_HOLD_VALUE", default="75")
+# NOTE: There is intentionally NO backorder-side minimum-value gate here.
+# Once the keep side clears MIN_SPLIT_VALUE, a split is always attempted
+# regardless of how small the backorder value is. Withholding an
+# otherwise-shippable, $150+ "ships now" portion just because the leftover
+# backorder value is small was the old behavior; it is removed as of
+# 2026-08-28 per design decision: no split0 order should ever be held for
+# a low backorder value. The backorder child is simply tagged with the
+# value band it actually lands in (see pick_split_band_tag) -- there is no
+# floor below which a split is refused.
 
 # Once a split is attempted and verified, the backorder child is tagged
 # with one of these two "value band" tags based on its ACTUAL (post
 # verification) value, in addition to BACKORDER_CHILD_TAG:
-#   MIN_BACKORDER_HOLD_VALUE <= bo_value < MIN_SPLIT_VALUE  -> SPLIT_REMAINDER_TAG
-#   bo_value >= MIN_SPLIT_VALUE                              -> SPLIT_150_TAG
+#   bo_value < MIN_SPLIT_VALUE   -> SPLIT_REMAINDER_TAG
+#   bo_value >= MIN_SPLIT_VALUE  -> SPLIT_150_TAG
 SPLIT_REMAINDER_TAG = env_first("SPLIT_REMAINDER_TAG", default="split-remainder") or "split-remainder"
 SPLIT_150_TAG = env_first("SPLIT_150_TAG", default="split-150") or "split-150"
 
@@ -227,7 +231,6 @@ print("API_VERSION  =", API_VERSION)
 print("DRAFT_ORDER_NAMES =", DRAFT_ORDER_NAMES)
 print("DRY_RUN =", DRY_RUN)
 print("MIN_SPLIT_VALUE (keep-side gate) =", MIN_SPLIT_VALUE)
-print("MIN_BACKORDER_HOLD_VALUE (backorder hold gate) =", MIN_BACKORDER_HOLD_VALUE)
 print("SPLIT_REMAINDER_TAG =", SPLIT_REMAINDER_TAG)
 print("SPLIT_150_TAG =", SPLIT_150_TAG)
 print("LAUNCH_TAG_PREFIX =", LAUNCH_TAG_PREFIX)
@@ -597,7 +600,7 @@ def ship_date_is_eligible(raw_ship_date: Optional[str]) -> Tuple[bool, Optional[
 
 
 # ----------------------------
-# RULE ENGINE — truth table + dual gate (asymmetric thresholds)
+# RULE ENGINE — truth table + single priority gate
 # ----------------------------
 def get_available_qty(line: Dict[str, Any]) -> Optional[int]:
     try:
@@ -689,10 +692,11 @@ def sum_value(lines: List[Dict[str, Any]]) -> Decimal:
 def pick_minvalue_tag(keep_ok: bool, bo_ok: bool) -> str:
     """
     Picks the reason tag for a full unwind (no split attempted / split
-    reversed). `bo_ok` here is ALWAYS evaluated against MIN_SPLIT_VALUE
-    ($150), never against MIN_BACKORDER_HOLD_VALUE ($75) — this function is
-    purely diagnostic labeling and its thresholds did not change. The
-    decision of *whether* to unwind is handled separately by the caller.
+    reversed). This only ever fires when the keep side fails to clear
+    MIN_SPLIT_VALUE — there is no longer a backorder-side minimum-value
+    gate, so `bo_ok` here is purely diagnostic labeling of whether the
+    backorder side *would* have cleared the $150 mark on its own, not a
+    decision input.
     """
     if not keep_ok and bo_ok:
         return INSTOCK_MINVALUE_TAG
@@ -704,9 +708,8 @@ def pick_minvalue_tag(keep_ok: bool, bo_ok: bool) -> str:
 def pick_split_band_tag(bo_value: Decimal) -> str:
     """
     Picks the value-band tag for a SUCCESSFUL split, based on the backorder
-    child's value. Only ever called once bo_value has already cleared
-    MIN_BACKORDER_HOLD_VALUE, so this is strictly choosing between the two
-    "we did split" bands, not deciding whether to split.
+    child's value. There is no floor here — any backorder value, including
+    values below the old $75 hold threshold, lands in SPLIT_REMAINDER_TAG.
     """
     if bo_value >= MIN_SPLIT_VALUE:
         return SPLIT_150_TAG
@@ -932,25 +935,24 @@ def process_draft(draft_id: str) -> str:
         keep_value = sum_value(keep_lines)
         bo_value = sum_value(backorder_lines)
 
-        # PRIORITY GATE: the ships-now side always uses the full
-        # MIN_SPLIT_VALUE ($150). If it fails, nothing else matters — the
-        # order is never split, regardless of the backorder value.
+        # PRIORITY GATE — the ONLY gate. The ships-now side always uses the
+        # full MIN_SPLIT_VALUE ($150). If it fails, nothing else matters —
+        # the order is never split, regardless of the backorder value. If
+        # it passes, a split is always attempted, no matter how small the
+        # backorder value is. There is no separate backorder-side minimum;
+        # that gate was removed on 2026-08-28 so a qualifying $150+
+        # ships-now portion is never held hostage by a small backorder
+        # remainder.
         keep_ok = keep_value >= MIN_SPLIT_VALUE
 
         # Used ONLY to pick the correct reason tag when keep_ok is False.
         # This intentionally still compares against MIN_SPLIT_VALUE (the
-        # original $150), not the new lowered hold threshold — this is
-        # diagnostic labeling, not a decision gate, and its meaning did not
-        # change.
+        # original $150) — this is diagnostic labeling, not a decision gate.
         bo_ok_at_keep_threshold = bo_value >= MIN_SPLIT_VALUE
 
-        # NEW: once keep_ok is True, this lowered threshold is what actually
-        # decides whether a split is attempted at all.
-        bo_hold_ok = bo_value >= MIN_BACKORDER_HOLD_VALUE
-
         logger.info(
-            "%s: projected keep=%s (ok=%s @ $%s) backorder=%s (hold_ok=%s @ $%s)",
-            name, keep_value, keep_ok, MIN_SPLIT_VALUE, bo_value, bo_hold_ok, MIN_BACKORDER_HOLD_VALUE,
+            "%s: projected keep=%s (ok=%s @ $%s) backorder=%s",
+            name, keep_value, keep_ok, MIN_SPLIT_VALUE, bo_value,
         )
 
         if not keep_ok:
@@ -961,17 +963,7 @@ def process_draft(draft_id: str) -> str:
             processing_released = True
             return "processed"
 
-        if not bo_hold_ok:
-            logger.info(
-                "%s: backorder value $%s below $%s hold threshold, no split attempted. Tagging '%s'.",
-                name, bo_value, MIN_BACKORDER_HOLD_VALUE, BO_MINVALUE_TAG,
-            )
-            final_tags = with_tag(with_tag(without_tag(list(live.get("tags") or []), PROCESSING_TAG), BO_MINVALUE_TAG), EVAL_DONE_TAG)
-            draft_update_return(draft_id, {"tags": final_tags}, label=f"tag {BO_MINVALUE_TAG}")
-            processing_released = True
-            return "processed"
-
-        # --- both gates cleared: attempt the real split ---
+        # --- keep-side gate cleared: always attempt the real split ---
         existing_po_meta = (live.get("po_meta") or {}).get("value")
         base_po = (existing_po_meta or live.get("poNumber") or "").strip()
         original_lines = list(lines)
@@ -1021,7 +1013,6 @@ def process_draft(draft_id: str) -> str:
         if DRY_RUN:
             actual_keep_value, actual_bo_value = keep_value, bo_value
             actual_keep_ok = keep_ok
-            actual_bo_hold_ok = bo_hold_ok
             actual_bo_ok_at_keep_threshold = bo_ok_at_keep_threshold
         else:
             refreshed_parent = fetch_draft_detail(draft_id)
@@ -1029,18 +1020,16 @@ def process_draft(draft_id: str) -> str:
             actual_keep_value = sum_value((refreshed_parent.get("lineItems") or {}).get("nodes") or [])
             actual_bo_value = sum_value((refreshed_child.get("lineItems") or {}).get("nodes") or [])
             actual_keep_ok = actual_keep_value >= MIN_SPLIT_VALUE
-            actual_bo_hold_ok = actual_bo_value >= MIN_BACKORDER_HOLD_VALUE
             actual_bo_ok_at_keep_threshold = actual_bo_value >= MIN_SPLIT_VALUE
             logger.info(
-                "%s: actual keep=%s (ok=%s @ $%s) backorder=%s (hold_ok=%s @ $%s)",
-                name, actual_keep_value, actual_keep_ok, MIN_SPLIT_VALUE,
-                actual_bo_value, actual_bo_hold_ok, MIN_BACKORDER_HOLD_VALUE,
+                "%s: actual keep=%s (ok=%s @ $%s) backorder=%s",
+                name, actual_keep_value, actual_keep_ok, MIN_SPLIT_VALUE, actual_bo_value,
             )
 
         if not actual_keep_ok:
             # Unwind: the projected keep value didn't hold up against the
             # real, Shopify-calculated total. This is the priority gate —
-            # it always wins regardless of the backorder value.
+            # and now the ONLY gate — so it always wins.
             tag = pick_minvalue_tag(False, actual_bo_ok_at_keep_threshold)
             logger.warning("%s: actual ships-now value failed the $%s gate, unwinding. Tagging '%s'.", name, MIN_SPLIT_VALUE, tag)
             draft_delete(child["id"], label="unwind child (actual keep value below threshold)")
@@ -1051,26 +1040,13 @@ def process_draft(draft_id: str) -> str:
             processing_released = True
             return "processed"
 
-        if not actual_bo_hold_ok:
-            # Unwind: keep side was fine, but the actual backorder value
-            # came in below the $75 hold threshold.
-            logger.warning(
-                "%s: actual backorder value $%s failed the $%s hold threshold, unwinding. Tagging '%s'.",
-                name, actual_bo_value, MIN_BACKORDER_HOLD_VALUE, BO_MINVALUE_TAG,
-            )
-            draft_delete(child["id"], label="unwind child (actual backorder below hold threshold)")
-            restore_input = {"lineItems": [build_line_input(l) for l in original_lines]}
-            draft_update_return(draft_id, restore_input, label="restore parent lines after unwind")
-            final_tags = with_tag(with_tag(without_tag(original_tags, PROCESSING_TAG), BO_MINVALUE_TAG), EVAL_DONE_TAG)
-            draft_update_return(draft_id, {"tags": final_tags}, label=f"tag {BO_MINVALUE_TAG} after unwind")
-            processing_released = True
-            return "processed"
-
         # --- success: split stands. Tag the child with its value band based
         # on the ACTUAL (post-verification) value, since the projected and
-        # actual values can diverge across the $150 line. The original gets
-        # only the internal eval-done marker (no business/outcome tag) so
-        # it isn't picked up again. ---
+        # actual values can diverge across the $150 line. There is no
+        # backorder-side floor: any actual_bo_value, however small, lands
+        # in SPLIT_REMAINDER_TAG or SPLIT_150_TAG. The original gets only
+        # the internal eval-done marker (no business/outcome tag) so it
+        # isn't picked up again. ---
         band_tag = pick_split_band_tag(actual_bo_value)
         child_current_tags = list(child.get("tags") or [])
         if band_tag not in child_current_tags:
