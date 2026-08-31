@@ -1,4 +1,4 @@
-name: Draft Order Splitter
+name: Draft Order Splitter V2
 
 on:
   workflow_dispatch:
