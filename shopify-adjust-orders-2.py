@@ -162,6 +162,16 @@ PROCESSING_TAG = env_first("V2_PROCESSING_TAG", default="v2-processing") or "v2-
 # Stamped on a draft (parent or otherwise-final) once this script has fully
 # evaluated it, regardless of outcome. Prevents re-evaluating the same order
 # forever. This is distinct from ORDER_FLOW_TAG, which never gets removed.
+#
+# EXCEPTION (added 2026-09-09): a draft tagged eval-done SOLELY because it
+# failed the keep-side minvalue gate (i.e. it also carries one of
+# ALL_MINVALUE_TAGS) is NOT actually terminal -- its inventory situation can
+# still change on a later day. Those drafts must keep recirculating through
+# this script every run until they either split or genuinely resolve some
+# other way. See build_open_ended_query, claim_processing_lock, and the
+# eval-done skip check in process_draft for the matching carve-out. A draft
+# tagged eval-done WITHOUT a minvalue tag (fully shipped as-is, or a
+# successful split's parent) remains permanently terminal as before.
 EVAL_DONE_TAG = env_first("V2_EVAL_DONE_TAG", default="eval-done") or "eval-done"
 
 # Applied to the single backorder child created on a successful split.
@@ -844,7 +854,13 @@ def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bo
 
 def claim_processing_lock(draft: Dict[str, Any]) -> bool:
     tags = list(draft.get("tags") or [])
-    if PROCESSING_TAG in tags or EVAL_DONE_TAG in tags or NEEDS_REVIEW_TAG in tags:
+    if PROCESSING_TAG in tags or NEEDS_REVIEW_TAG in tags:
+        return False
+    # A truly terminal eval-done draft (fully shipped, or a successful
+    # split's parent) still blocks here. A retry-eligible eval-done draft
+    # (also carries one of ALL_MINVALUE_TAGS) is allowed through — see the
+    # EVAL_DONE_TAG comment in ENV CONFIG for why.
+    if EVAL_DONE_TAG in tags and not (set(tags) & ALL_MINVALUE_TAGS):
         return False
     if BACKORDER_CHILD_TAG in tags:
         return False
@@ -889,7 +905,7 @@ def process_draft(draft_id: str) -> str:
         logger.info("%s: SKIP (missing allow-list tag '%s').", name, ORDER_FLOW_TAG)
         return "skipped"
 
-    if EVAL_DONE_TAG in existing_tags:
+    if EVAL_DONE_TAG in existing_tags and not (set(existing_tags) & ALL_MINVALUE_TAGS):
         logger.info("%s: SKIP (already evaluated; tag '%s' present).", name, EVAL_DONE_TAG)
         return "skipped"
     if BACKORDER_CHILD_TAG in existing_tags:
@@ -927,7 +943,12 @@ def process_draft(draft_id: str) -> str:
 
         if not backorder_lines:
             logger.info("%s: fully ships now, no backorder items. Tagging '%s'.", name, EVAL_DONE_TAG)
-            final_tags = with_tag(without_tag(list(live.get("tags") or []), PROCESSING_TAG), EVAL_DONE_TAG)
+            # Strip any stale minvalue tag from a prior failed pass — this
+            # draft is now genuinely terminal, not just re-tagged the same way.
+            final_tags = with_tag(
+                without_tags(list(live.get("tags") or []), ALL_MINVALUE_TAGS | {PROCESSING_TAG}),
+                EVAL_DONE_TAG,
+            )
             draft_update_return(draft_id, {"tags": final_tags}, label="tag eval-done (no split needed)")
             processing_released = True
             return "processed"
@@ -958,7 +979,11 @@ def process_draft(draft_id: str) -> str:
         if not keep_ok:
             tag = pick_minvalue_tag(keep_ok, bo_ok_at_keep_threshold)
             logger.info("%s: ships-now value below $%s, no split attempted. Tagging '%s'.", name, MIN_SPLIT_VALUE, tag)
-            final_tags = with_tag(with_tag(without_tag(list(live.get("tags") or []), PROCESSING_TAG), tag), EVAL_DONE_TAG)
+            # Strip any prior minvalue tag first — a retried draft can land
+            # in a different band than last time (e.g. instock-minvalue ->
+            # order-minvalue), and it should only ever carry one at a time.
+            base_tags = without_tags(list(live.get("tags") or []), ALL_MINVALUE_TAGS | {PROCESSING_TAG})
+            final_tags = with_tag(with_tag(base_tags, tag), EVAL_DONE_TAG)
             draft_update_return(draft_id, {"tags": final_tags}, label=f"tag {tag}")
             processing_released = True
             return "processed"
@@ -1035,7 +1060,10 @@ def process_draft(draft_id: str) -> str:
             draft_delete(child["id"], label="unwind child (actual keep value below threshold)")
             restore_input = {"lineItems": [build_line_input(l) for l in original_lines]}
             draft_update_return(draft_id, restore_input, label="restore parent lines after unwind")
-            final_tags = with_tag(with_tag(without_tag(original_tags, PROCESSING_TAG), tag), EVAL_DONE_TAG)
+            # Strip any prior minvalue tag first, same reasoning as the
+            # projected-failure branch above.
+            base_tags = without_tags(original_tags, ALL_MINVALUE_TAGS | {PROCESSING_TAG})
+            final_tags = with_tag(with_tag(base_tags, tag), EVAL_DONE_TAG)
             draft_update_return(draft_id, {"tags": final_tags}, label=f"tag {tag} after unwind")
             processing_released = True
             return "processed"
@@ -1053,7 +1081,9 @@ def process_draft(draft_id: str) -> str:
             child_final_tags = with_tag(child_current_tags, band_tag)
             child = draft_update_return(child["id"], {"tags": child_final_tags}, label=f"tag child {band_tag}")[1] or child
 
-        final_parent_tags = with_tag(without_tag(original_tags, PROCESSING_TAG), EVAL_DONE_TAG)
+        # Strip any stale minvalue tag from a prior failed pass — this
+        # parent is now genuinely terminal via a successful split.
+        final_parent_tags = with_tag(without_tags(original_tags, ALL_MINVALUE_TAGS | {PROCESSING_TAG}), EVAL_DONE_TAG)
         draft_update_return(draft_id, {"tags": final_parent_tags}, label="tag eval-done (split succeeded)")
         logger.info("%s: split succeeded (%s, backorder=%s). Backorder child: %s", name, band_tag, actual_bo_value, child.get("name") or child.get("id"))
         processing_released = True
@@ -1090,10 +1120,22 @@ def build_open_ended_query() -> str:
     # nothing ever looked at it again). Every split0-tagged, not-yet-final
     # draft must be evaluated on every run regardless of age. MAX_DRAFTS
     # is the correct control for API-call volume, not a date cutoff.
+    #
+    # EVAL_DONE CARVE-OUT (added 2026-09-09): a draft tagged eval-done is
+    # normally terminal and excluded below -- EXCEPT when it also carries
+    # one of ALL_MINVALUE_TAGS. Those drafts failed the keep-side gate on a
+    # prior run, not because the order is actually finished, but because
+    # inventory/value at that moment didn't clear $MIN_SPLIT_VALUE. That
+    # can change on a later day (restock, price edit, etc.), so they must
+    # keep recirculating through this query instead of being abandoned the
+    # same way #D28884 was. See claim_processing_lock and the skip check in
+    # process_draft for the matching carve-out -- all three gates have to
+    # agree or this fix is a no-op.
+    minvalue_or_clause = " OR ".join(f"tag:{t}" for t in sorted(ALL_MINVALUE_TAGS))
     parts = [
         "status:open",
         f"tag:{ORDER_FLOW_TAG}",
-        f"-tag:{EVAL_DONE_TAG}",
+        f"(-tag:{EVAL_DONE_TAG} OR {minvalue_or_clause})",
         f"-tag:{BACKORDER_CHILD_TAG}",
         f"-tag:{NEEDS_REVIEW_TAG}",
         f"-tag:{PROCESSING_TAG}",
