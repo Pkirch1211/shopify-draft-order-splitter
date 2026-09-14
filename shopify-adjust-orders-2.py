@@ -419,6 +419,10 @@ query($id:ID!, $locationId:ID!, $poNamespace: String!, $poKey: String!, $shipDat
     note2
     presentmentCurrencyCode
     paymentTerms { dueInDays paymentTermsName paymentTermsType }
+    appliedDiscount {
+      description title value valueType
+      amountV2 { amount currencyCode }
+    }
     customAttributes { key value }
     po_meta: metafield(namespace: $poNamespace, key: $poKey) { value }
     ship_date_meta: metafield(namespace: $shipDateNamespace, key: $shipDateKey) { value }
@@ -520,6 +524,24 @@ def applied_discount_input(ad: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
     if ad.get("amountV2") and ad["amountV2"].get("amount") is not None:
         out["amount"] = str(ad["amountV2"]["amount"])
     return {k: v for k, v in out.items() if v is not None} or None
+
+
+def with_order_discount(input_data: Dict[str, Any], order_discount_input: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Shopify strips a draft order's order-level appliedDiscount on ANY
+    draftOrderUpdate call that doesn't explicitly re-supply it -- even
+    updates that only touch tags or lineItems. draftOrderDuplicate copies
+    the discount onto a new child, but the very next draftOrderUpdate this
+    script makes (to set lineItems/tags/etc.) would silently wipe it back
+    off again unless it's included every time. This wrapper is applied at
+    every draftOrderUpdate call site in this script so the order-level
+    discount survives the whole split/tag lifecycle. See decisions log,
+    2026-09-14.
+    """
+    if order_discount_input:
+        input_data = dict(input_data)
+        input_data["appliedDiscount"] = order_discount_input
+    return input_data
 
 
 def merge_custom_attributes(existing: List[Dict[str, Any]], additions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -822,7 +844,7 @@ def without_tags(tags: List[str], tags_to_remove: Set[str]) -> List[str]:
     return [t for t in (tags or []) if t not in remove]
 
 
-def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bool:
+def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "", order_discount_input: Optional[Dict[str, Any]] = None) -> bool:
     """
     Ported from v1's escalation pattern. Used for failure modes that should
     NOT be silently retried forever on the next cron tick — e.g. a variant
@@ -842,7 +864,11 @@ def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bo
         )
         return True
 
-    errs, updated = draft_update_return(draft_id, {"tags": desired_tags}, label=f"tag {NEEDS_REVIEW_TAG}")
+    errs, updated = draft_update_return(
+        draft_id,
+        with_order_discount({"tags": desired_tags}, order_discount_input),
+        label=f"tag {NEEDS_REVIEW_TAG}",
+    )
     if errs:
         logger.warning(
             "Could not tag %s with '%s'%s: %s",
@@ -852,7 +878,7 @@ def try_tag_needs_review(draft_id: str, tags: List[str], reason: str = "") -> bo
     return NEEDS_REVIEW_TAG in set(updated.get("tags") or [])
 
 
-def claim_processing_lock(draft: Dict[str, Any]) -> bool:
+def claim_processing_lock(draft: Dict[str, Any], order_discount_input: Optional[Dict[str, Any]] = None) -> bool:
     tags = list(draft.get("tags") or [])
     if PROCESSING_TAG in tags or NEEDS_REVIEW_TAG in tags:
         return False
@@ -868,7 +894,11 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
         logger.info("DRY RUN — would add processing tag to %s", draft.get("name"))
         return True
     new_tags = without_tags(with_tag(tags, PROCESSING_TAG), CONVERSION_TRIGGER_TAGS)
-    errs, updated = draft_update_return(draft["id"], {"tags": new_tags}, label="claim processing lock")
+    errs, updated = draft_update_return(
+        draft["id"],
+        with_order_discount({"tags": new_tags}, order_discount_input),
+        label="claim processing lock",
+    )
     if errs:
         msg_join = " | ".join((e.get("message", "") or "") for e in errs).lower()
         if "no longer available" in msg_join:
@@ -876,18 +906,22 @@ def claim_processing_lock(draft: Dict[str, Any]) -> bool:
                 "%s: product unavailable while claiming lock; tagging '%s'.",
                 draft.get("name"), NEEDS_REVIEW_TAG,
             )
-            try_tag_needs_review(draft["id"], tags, reason="product no longer available")
+            try_tag_needs_review(draft["id"], tags, reason="product no longer available", order_discount_input=order_discount_input)
             return False
         raise RuntimeError(f"Failed to claim processing lock: {errs}")
     return PROCESSING_TAG in set(updated.get("tags") or [])
 
 
-def release_processing_lock(draft_id: str, tags: List[str]) -> None:
+def release_processing_lock(draft_id: str, tags: List[str], order_discount_input: Optional[Dict[str, Any]] = None) -> None:
     if DRY_RUN:
         logger.info("DRY RUN — would remove processing tag from %s", draft_id)
         return
     cleaned = without_tag(tags, PROCESSING_TAG)
-    errs, _ = draft_update_return(draft_id, {"tags": cleaned}, label="release processing lock")
+    errs, _ = draft_update_return(
+        draft_id,
+        with_order_discount({"tags": cleaned}, order_discount_input),
+        label="release processing lock",
+    )
     if errs:
         logger.warning("Failed to release processing lock for %s: %s", draft_id, errs)
 
@@ -899,6 +933,9 @@ def process_draft(draft_id: str) -> str:
     draft = fetch_draft_detail(draft_id)
     name = draft.get("name", draft_id)
     existing_tags = list(draft.get("tags") or [])
+    # Captured up front so the lock-claim call (which happens before the
+    # post-lock re-fetch below) can still preserve the order-level discount.
+    order_discount_input = applied_discount_input(draft.get("appliedDiscount"))
 
     # --- allow-list gate: only new-logic orders ever get this far ---
     if ORDER_FLOW_TAG not in existing_tags:
@@ -929,13 +966,16 @@ def process_draft(draft_id: str) -> str:
         logger.info("%s: SKIP (ship date %r not yet eligible).", name, raw_ship_date)
         return "skipped"
 
-    if not claim_processing_lock(draft):
+    if not claim_processing_lock(draft, order_discount_input):
         logger.info("%s: SKIP (could not claim processing lock).", name)
         return "skipped"
 
     processing_released = False
     try:
         live = fetch_draft_detail(draft_id)  # re-fetch fresh after claiming the lock
+        # Prefer the freshly re-fetched discount, but fall back to the one
+        # captured before the lock claim if the re-fetch is ever missing it.
+        order_discount_input = applied_discount_input(live.get("appliedDiscount")) or order_discount_input
         lines = (live.get("lineItems") or {}).get("nodes") or []
 
 
@@ -949,7 +989,11 @@ def process_draft(draft_id: str) -> str:
                 without_tags(list(live.get("tags") or []), ALL_MINVALUE_TAGS | {PROCESSING_TAG}),
                 EVAL_DONE_TAG,
             )
-            draft_update_return(draft_id, {"tags": final_tags}, label="tag eval-done (no split needed)")
+            draft_update_return(
+                draft_id,
+                with_order_discount({"tags": final_tags}, order_discount_input),
+                label="tag eval-done (no split needed)",
+            )
             processing_released = True
             return "processed"
 
@@ -984,7 +1028,11 @@ def process_draft(draft_id: str) -> str:
             # order-minvalue), and it should only ever carry one at a time.
             base_tags = without_tags(list(live.get("tags") or []), ALL_MINVALUE_TAGS | {PROCESSING_TAG})
             final_tags = with_tag(with_tag(base_tags, tag), EVAL_DONE_TAG)
-            draft_update_return(draft_id, {"tags": final_tags}, label=f"tag {tag}")
+            draft_update_return(
+                draft_id,
+                with_order_discount({"tags": final_tags}, order_discount_input),
+                label=f"tag {tag}",
+            )
             processing_released = True
             return "processed"
 
@@ -1010,27 +1058,36 @@ def process_draft(draft_id: str) -> str:
                 "%s: non-idempotent duplicate mutation failed; not retrying. Tagging '%s'. Error: %s",
                 name, NEEDS_REVIEW_TAG, e,
             )
-            try_tag_needs_review(draft_id, original_tags, reason="duplicate mutation failed")
+            try_tag_needs_review(draft_id, original_tags, reason="duplicate mutation failed", order_discount_input=order_discount_input)
             processing_released = True
             raise
 
         try:
             ca_add, mf_add = build_linking_fields(base_po=base_po, original_draft_id=draft_id, is_child=True)
-            child_input = {
-                "lineItems": [build_line_input(l) for l in backorder_lines],
-                "poNumber": build_po_number(base_po),
-                "tags": with_tag(without_tags(list(original_tags), CONVERSION_TRIGGER_TAGS.union({ORDER_FLOW_TAG, PROCESSING_TAG})), BACKORDER_CHILD_TAG),
-                "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
-                "metafields": merge_metafields(original_metafields, mf_add),
-            }
+            child_input = with_order_discount(
+                {
+                    "lineItems": [build_line_input(l) for l in backorder_lines],
+                    "poNumber": build_po_number(base_po),
+                    "tags": with_tag(
+                        without_tags(
+                            list(original_tags),
+                            CONVERSION_TRIGGER_TAGS.union({ORDER_FLOW_TAG, PROCESSING_TAG, EVAL_DONE_TAG}).union(ALL_MINVALUE_TAGS),
+                        ),
+                        BACKORDER_CHILD_TAG,
+                    ),
+                    "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
+                    "metafields": merge_metafields(original_metafields, mf_add),
+                },
+                order_discount_input,
+            )
             child = draft_update_return(child["id"], child_input, label="child (backorder) update")[1] or child
 
-            parent_input = {"lineItems": [build_line_input(l) for l in keep_lines]}
+            parent_input = with_order_discount({"lineItems": [build_line_input(l) for l in keep_lines]}, order_discount_input)
             parent = draft_update_return(draft_id, parent_input, label="parent (ship-now) update")[1]
         except Exception:
             logger.exception("%s: split mutation failed, rolling back child.", name)
             draft_delete(child["id"], label="rollback child after failed update")
-            release_processing_lock(draft_id, original_tags if DRY_RUN else list(live.get("tags") or []))
+            release_processing_lock(draft_id, original_tags if DRY_RUN else list(live.get("tags") or []), order_discount_input)
             processing_released = True
             raise
 
@@ -1058,13 +1115,17 @@ def process_draft(draft_id: str) -> str:
             tag = pick_minvalue_tag(False, actual_bo_ok_at_keep_threshold)
             logger.warning("%s: actual ships-now value failed the $%s gate, unwinding. Tagging '%s'.", name, MIN_SPLIT_VALUE, tag)
             draft_delete(child["id"], label="unwind child (actual keep value below threshold)")
-            restore_input = {"lineItems": [build_line_input(l) for l in original_lines]}
+            restore_input = with_order_discount({"lineItems": [build_line_input(l) for l in original_lines]}, order_discount_input)
             draft_update_return(draft_id, restore_input, label="restore parent lines after unwind")
             # Strip any prior minvalue tag first, same reasoning as the
             # projected-failure branch above.
             base_tags = without_tags(original_tags, ALL_MINVALUE_TAGS | {PROCESSING_TAG})
             final_tags = with_tag(with_tag(base_tags, tag), EVAL_DONE_TAG)
-            draft_update_return(draft_id, {"tags": final_tags}, label=f"tag {tag} after unwind")
+            draft_update_return(
+                draft_id,
+                with_order_discount({"tags": final_tags}, order_discount_input),
+                label=f"tag {tag} after unwind",
+            )
             processing_released = True
             return "processed"
 
@@ -1079,12 +1140,20 @@ def process_draft(draft_id: str) -> str:
         child_current_tags = list(child.get("tags") or [])
         if band_tag not in child_current_tags:
             child_final_tags = with_tag(child_current_tags, band_tag)
-            child = draft_update_return(child["id"], {"tags": child_final_tags}, label=f"tag child {band_tag}")[1] or child
+            child = draft_update_return(
+                child["id"],
+                with_order_discount({"tags": child_final_tags}, order_discount_input),
+                label=f"tag child {band_tag}",
+            )[1] or child
 
         # Strip any stale minvalue tag from a prior failed pass — this
         # parent is now genuinely terminal via a successful split.
         final_parent_tags = with_tag(without_tags(original_tags, ALL_MINVALUE_TAGS | {PROCESSING_TAG}), EVAL_DONE_TAG)
-        draft_update_return(draft_id, {"tags": final_parent_tags}, label="tag eval-done (split succeeded)")
+        draft_update_return(
+            draft_id,
+            with_order_discount({"tags": final_parent_tags}, order_discount_input),
+            label="tag eval-done (split succeeded)",
+        )
         logger.info("%s: split succeeded (%s, backorder=%s). Backorder child: %s", name, band_tag, actual_bo_value, child.get("name") or child.get("id"))
         processing_released = True
         return "processed"
@@ -1092,7 +1161,7 @@ def process_draft(draft_id: str) -> str:
     finally:
         if not processing_released:
             try:
-                release_processing_lock(draft_id, list(draft.get("tags") or []))
+                release_processing_lock(draft_id, list(draft.get("tags") or []), order_discount_input)
             except Exception:
                 logger.exception("%s: CRITICAL — could not release processing lock in final cleanup.", name)
 
