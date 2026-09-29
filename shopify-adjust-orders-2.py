@@ -544,6 +544,24 @@ def with_order_discount(input_data: Dict[str, Any], order_discount_input: Option
     return input_data
 
 
+def child_order_discount(order_discount_input: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    The order-level discount a backorder CHILD should carry (2026-09-28).
+    PERCENTAGE discounts carry down to the child -- they scale with
+    whatever lines the child holds. FIXED_AMOUNT discounts stay on the
+    parent only: a flat $ off was entered against the original draft, and
+    copying it onto the child would apply it twice. Returns None for fixed
+    (or no) discount, which the child update sends as an explicit null to
+    clear the copy draftOrderDuplicate made. Mirrors the identical helper
+    in partial-instock-split-v2.py.
+    """
+    if not order_discount_input:
+        return None
+    if str(order_discount_input.get("valueType") or "").upper() == "PERCENTAGE":
+        return order_discount_input
+    return None
+
+
 def merge_custom_attributes(existing: List[Dict[str, Any]], additions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: Dict[str, str] = {}
     for item in existing or []:
@@ -1044,6 +1062,15 @@ def process_draft(draft_id: str) -> str:
         original_custom_attributes = live.get("customAttributes") or []
         original_metafields = (live.get("metafields") or {}).get("nodes") or []
 
+        # Child gets PERCENTAGE order discounts only; FIXED_AMOUNT stays on
+        # the parent (2026-09-28). See child_order_discount.
+        child_discount_input = child_order_discount(order_discount_input)
+        if order_discount_input and not child_discount_input:
+            logger.info(
+                "%s: order discount is %s (not PERCENTAGE) — kept on parent, NOT carried to child.",
+                name, order_discount_input.get("valueType"),
+            )
+
         try:
             child = draft_duplicate(draft_id)
         except Exception as e:
@@ -1064,24 +1091,26 @@ def process_draft(draft_id: str) -> str:
 
         try:
             ca_add, mf_add = build_linking_fields(base_po=base_po, original_draft_id=draft_id, is_child=True)
-            child_input = with_order_discount(
-                {
-                    "lineItems": [build_line_input(l) for l in backorder_lines],
-                    "poNumber": build_po_number(base_po),
-                    "tags": with_tag(
-                        without_tags(
-                            list(original_tags),
-                            CONVERSION_TRIGGER_TAGS.union({ORDER_FLOW_TAG, PROCESSING_TAG, EVAL_DONE_TAG}).union(ALL_MINVALUE_TAGS),
-                        ),
-                        BACKORDER_CHILD_TAG,
+            # appliedDiscount is set EXPLICITLY on the child: the percentage
+            # discount, or null to clear the fixed-amount discount that
+            # draftOrderDuplicate copied over from the parent.
+            child_input = {
+                "lineItems": [build_line_input(l) for l in backorder_lines],
+                "poNumber": build_po_number(base_po),
+                "tags": with_tag(
+                    without_tags(
+                        list(original_tags),
+                        CONVERSION_TRIGGER_TAGS.union({ORDER_FLOW_TAG, PROCESSING_TAG, EVAL_DONE_TAG}).union(ALL_MINVALUE_TAGS),
                     ),
-                    "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
-                    "metafields": merge_metafields(original_metafields, mf_add),
-                },
-                order_discount_input,
-            )
+                    BACKORDER_CHILD_TAG,
+                ),
+                "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
+                "metafields": merge_metafields(original_metafields, mf_add),
+                "appliedDiscount": child_discount_input,
+            }
             child = draft_update_return(child["id"], child_input, label="child (backorder) update")[1] or child
 
+            # Parent keeps its order discount regardless of type.
             parent_input = with_order_discount({"lineItems": [build_line_input(l) for l in keep_lines]}, order_discount_input)
             parent = draft_update_return(draft_id, parent_input, label="parent (ship-now) update")[1]
         except Exception:
@@ -1142,7 +1171,7 @@ def process_draft(draft_id: str) -> str:
             child_final_tags = with_tag(child_current_tags, band_tag)
             child = draft_update_return(
                 child["id"],
-                with_order_discount({"tags": child_final_tags}, order_discount_input),
+                with_order_discount({"tags": child_final_tags}, child_discount_input),
                 label=f"tag child {band_tag}",
             )[1] or child
 
